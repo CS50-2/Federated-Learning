@@ -154,19 +154,50 @@ def main():
         print(f"\n🔄 第 {r+1} 轮聚合")
         client_state_dicts = []
 
-        # 客户端本地训练
-        for label, client_loader in client_loaders.items():
+        ###################### changed by TAIGE for random client training ###########################
+
+        # # 客户端本地训练
+        # for label, client_loader in client_loaders.items():
+        #     local_model = MLPModel()
+        #     local_model.load_state_dict(global_model.state_dict())  # 复制全局模型参数
+        #     local_state = local_train(local_model, client_loader, epochs=1, lr=0.01)  # 训练 1 轮
+        #     client_state_dicts.append((label, local_state))  # 存储 (类别, 训练后的参数)
+
+        #     param_mean = {name: param.mean().item() for name, param in local_model.named_parameters()}
+        #     print(f"  ✅ 客户端 {label} (类别 {label}) 训练完成 | 样本数量: {client_data_sizes[label]}")
+        #     print(f"    📌 客户端 {label} 模型参数均值: {param_mean}")
+
+        # # 聚合模型参数
+        # global_model = fed_avg(global_model, client_state_dicts, client_data_sizes)
+
+        # Randomly select 2 out of 10 clients
+        selected_clients = random.sample(list(client_loaders.keys()), 2)
+        print(f"🧩 Selected clients for round {r+1}: {selected_clients}")
+
+        # Randomly select 2 out of 10 clients
+        selected_clients = random.sample(list(client_loaders.keys()), 2)
+        print(f"🧩 Selected clients for round {r+1}: {selected_clients}")
+
+        for label in selected_clients:
+            client_loader = client_loaders[label]
             local_model = MLPModel()
-            local_model.load_state_dict(global_model.state_dict())  # 复制全局模型参数
-            local_state = local_train(local_model, client_loader, epochs=1, lr=0.01)  # 训练 1 轮
-            client_state_dicts.append((label, local_state))  # 存储 (类别, 训练后的参数)
+            local_model.load_state_dict(global_model.state_dict())
+            local_state = local_train(local_model, client_loader, epochs=1, lr=0.01)
+            client_state_dicts.append((label, local_state))
 
-            param_mean = {name: param.mean().item() for name, param in local_model.named_parameters()}
-            print(f"  ✅ 客户端 {label} (类别 {label}) 训练完成 | 样本数量: {client_data_sizes[label]}")
-            print(f"    📌 客户端 {label} 模型参数均值: {param_mean}")
+            param_mean = {}  
+            for name, param in local_model.named_parameters(): 
+                mean_value = param.mean().item()               
+                param_mean[name] = mean_value  
 
-        # 聚合模型参数
-        global_model = fed_avg(global_model, client_state_dicts, client_data_sizes)
+            print(f"  ✅ 客户端 {label} 训练完成 | 样本数量: {client_data_sizes[label]}")
+            print(f"    📌 模型参数均值: {param_mean}")
+
+        # Aggregate client parameters
+        selected_client_sizes = {label: client_data_sizes[label] for label in selected_clients}
+        fed_avg(global_model, client_state_dicts, selected_client_sizes)
+
+        ##########################################################################################
 
         # 计算全局模型参数平均值
         global_param_mean = {name: param.mean().item() for name, param in global_model.named_parameters()}
