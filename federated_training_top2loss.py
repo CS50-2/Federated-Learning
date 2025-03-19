@@ -155,63 +155,51 @@ def main():
     # 初始化全局模型
     global_model = MLPModel()
 
-    rounds = 20  # 联邦学习轮数
+    ###################### changed by TAIGE for top two loss client training ###########################
+
+    # 4. Federated training
+    rounds = 100
     for r in range(rounds):
-        print(f"\n🔄 第 {r+1} 轮聚合")
+        print(f"\n=== Round {r+1} FedAvg ===")
+
+        # (a) First, measure the average loss of each client under the current global model
+        client_losses = {}
+        for label, loader in client_loaders.items():
+            loss_val = evaluate(global_model, loader)
+            client_losses[label] = loss_val
+
+        # (b) Sort the clients by loss in descending order, and select the top 2
+        sorted_clients = sorted(client_losses.items(), key=lambda x: x[1], reverse=True)
+        top2 = sorted_clients[:2]  # top 2 (label, lossValue)
+        selected_clients = [item[0] for item in top2]  # extract only the labels
+
+        print("    All clients' loss:", client_losses)
+        print("    Top 2 clients with the highest loss:", selected_clients)
+
+        # (c) Perform local training on these two selected clients
         client_state_dicts = []
-
-        ###################### changed by TAIGE for random client training ###########################
-
-        # # 客户端本地训练
-        # for label, client_loader in client_loaders.items():
-        #     local_model = MLPModel()
-        #     local_model.load_state_dict(global_model.state_dict())  # 复制全局模型参数
-        #     local_state = local_train(local_model, client_loader, epochs=1, lr=0.01)  # 训练 1 轮
-        #     client_state_dicts.append((label, local_state))  # 存储 (类别, 训练后的参数)
-
-        #     param_mean = {name: param.mean().item() for name, param in local_model.named_parameters()}
-        #     print(f"  ✅ 客户端 {label} (类别 {label}) 训练完成 | 样本数量: {client_data_sizes[label]}")
-        #     print(f"    📌 客户端 {label} 模型参数均值: {param_mean}")
-
-        # # 聚合模型参数
-        # global_model = fed_avg(global_model, client_state_dicts, client_data_sizes)
-
-        # Randomly select 2 out of 10 clients
-        selected_clients = random.sample(list(client_loaders.keys()), 2)
-        print(f"🧩 Selected clients for round {r+1}: {selected_clients}")
-
-        # Randomly select 2 out of 10 clients
-        selected_clients = random.sample(list(client_loaders.keys()), 2)
-        print(f"🧩 Selected clients for round {r+1}: {selected_clients}")
-
+        selected_client_sizes = {}
         for label in selected_clients:
-            client_loader = client_loaders[label]
             local_model = MLPModel()
-            local_model.load_state_dict(global_model.state_dict())
-            local_state = local_train(local_model, client_loader, epochs=1, lr=0.01)
-            client_state_dicts.append((label, local_state))
+            local_model.load_state_dict(global_model.state_dict())  # copy the global model parameters
+            updated_params = local_train(
+                local_model,
+                client_loaders[label],
+                epochs=1,   # you can increase this for more local training
+                lr=0.01     # you can tune this learning rate
+            )
+            client_state_dicts.append((label, updated_params))
+            selected_client_sizes[label] = client_data_sizes[label]  # needed for weighted FedAvg
 
-            param_mean = {}  
-            for name, param in local_model.named_parameters(): 
-                mean_value = param.mean().item()               
-                param_mean[name] = mean_value  
-
-            print(f"  ✅ 客户端 {label} 训练完成 | 样本数量: {client_data_sizes[label]}")
-            print(f"    📌 模型参数均值: {param_mean}")
-
-        # Aggregate client parameters
-        selected_client_sizes = {label: client_data_sizes[label] for label in selected_clients}
+        # (d) Aggregate with FedAvg
         fed_avg(global_model, client_state_dicts, selected_client_sizes)
 
+        # (e) Evaluate the current global model on the test set
+        loss, acc = evaluate(global_model, test_loader)
+        print(f"  [Round {r+1}] Test Loss = {loss:.4f}, Test Acc = {acc:.2f}%")
+
+
         ##########################################################################################
-
-        # 计算全局模型参数平均值
-        global_param_mean = {name: param.mean().item() for name, param in global_model.named_parameters()}
-        print(f"🔄 轮 {r+1} 结束后，全局模型参数均值: {global_param_mean}")
-
-        # 评估模型
-        loss, accuracy = evaluate(global_model, test_loader)
-        print(f"📊 测试集损失: {loss:.4f} | 测试集准确率: {accuracy:.2f}%")
 
     # 输出最终模型的性能
     final_loss, final_accuracy = evaluate(global_model, test_loader)
