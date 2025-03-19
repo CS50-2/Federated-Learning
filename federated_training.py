@@ -17,6 +17,8 @@ import numpy as np
 import random
 import os
 import matplotlib.pyplot as plt
+import ssl 
+
 
 # 定义 MLP 模型
 class MLPModel(nn.Module):
@@ -36,6 +38,10 @@ class MLPModel(nn.Module):
 
 # 加载 MNIST 数据集
 def load_mnist_data(data_path="./data"):
+    
+    # Temporarily Skip SSL velidation step 
+    ssl._create_default_https_context = ssl._create_unverified_context
+
     transform = transforms.Compose([transforms.ToTensor(), transforms.Normalize((0.1307,), (0.3081,))])
 
     if os.path.exists(os.path.join(data_path, "MNIST/raw/train-images-idx3-ubyte")):
@@ -149,7 +155,7 @@ def main():
     # 初始化全局模型
     global_model = MLPModel()
 
-    rounds = 10  # 联邦学习轮数
+    rounds = 50  # 联邦学习轮数
     for r in range(rounds):
         print(f"\n🔄 第 {r+1} 轮聚合")
         client_state_dicts = []
