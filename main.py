@@ -17,6 +17,9 @@ import numpy as np
 import random
 import os
 import matplotlib.pyplot as plt
+import csv
+import pandas as pd
+from datetime import datetime
 
 
 # 定义 MLP 模型
@@ -64,39 +67,112 @@ def visualize_mnist_samples(dataset, num_samples=10):
 
 
 # 分割 MNIST 数据，使每个客户端只包含某个数字类别
-def split_data_by_label(dataset):
-    # 自定义每个类别的数据量
+# def split_data_by_label(dataset):
+#     # 自定义每个类别的数据量
+#     client_data_sizes = {
+#         0: 5000,
+#         1: 7000,
+#         2: 6000,
+#         3: 8000,
+#         4: 4000,
+#         5: 9000,
+#         6: 3000,
+#         7: 10000,
+#         8: 7500,
+#         9: 6500
+#     }
+
+#     label_to_indices = {i: [] for i in range(10)}  # 记录每个类别的索引
+
+#     # 收集每个类别的数据索引
+#     for idx, (_, label) in enumerate(dataset):
+#         label_to_indices[label].append(idx)
+
+#     # 为每个 client 选择对应类别的数据，并裁剪成需要的数量
+#     client_datasets = []
+#     for label, size in client_data_sizes.items():
+#         indices = label_to_indices[label][:size]  # 取前 size 个样本
+#         client_datasets.append((label, torch.utils.data.Subset(dataset, indices)))  # 存储 (类别, 数据集)
+
+#     print("📊 客户端数据分布:", client_data_sizes)
+#     return client_datasets, client_data_sizes
+
+def split_data_by_label(dataset, num_clients=10):
+    """
+    手动划分数据集，每个客户端包含 10 个类别，并自定义样本数量。
+    :param dataset: 原始数据集（如 MNIST）
+    :param num_clients: 客户端总数
+    :return: (客户端数据集, 客户端数据大小)
+    """
+    # 手动划分的样本数量（每个客户端 10 个类别的数据量）
+    # client_data_sizes = {
+    #     0: {0: 600, 1: 700, 2: 600, 3: 600, 4: 500, 5: 500, 6: 100, 7: 100, 8: 100, 9: 100},
+    #     1: {0: 700, 1: 600, 2: 600, 3: 600, 4: 500, 5: 100, 6: 100, 7: 100, 8: 100, 9: 600},
+    #     2: {0: 500, 1: 600, 2: 700, 3: 600, 4: 100, 5: 100, 6: 100, 7: 100, 8: 600, 9: 500},
+    #     3: {0: 600, 1: 600, 2: 500, 3: 100, 4: 100, 5: 100, 6: 100, 7: 500, 8: 500, 9: 700},
+    #     4: {0: 600, 1: 500, 2: 100, 3: 100, 4: 100, 5: 100, 6: 600, 7: 700, 8: 500, 9: 500},
+    #     5: {0: 500, 1: 100, 2: 100, 3: 100, 4: 100, 5: 600, 6: 500, 7: 600, 8: 700, 9: 600},
+    #     6: {0: 100, 1: 100, 2: 100, 3: 100, 4: 700, 5: 500, 6: 600, 7: 500, 8: 500, 9: 600},
+    #     7: {0: 100, 1: 100, 2: 100, 3: 600, 4: 500, 5: 600, 6: 500, 7: 600, 8: 500, 9: 100},
+    #     8: {0: 100, 1: 100, 2: 500, 3: 500, 4: 600, 5: 500, 6: 600, 7: 500, 8: 100, 9: 100},
+    #     9: {0: 100, 1: 700, 2: 600, 3: 600, 4: 600, 5: 500, 6: 600, 7: 100, 8: 100, 9: 100}
+    # }
+
     client_data_sizes = {
-        0: 50,
-        1: 70,
-        2: 60,
-        3: 80,
-        4: 40,
-        5: 90,
-        6: 30,
-        7: 100,
-        8: 75,
-        9: 65
+        0: {0: 600},
+        1: {1: 700},
+        2: {2: 500},
+        3: {3: 600},
+        4: {4: 600},
+        5: {5: 500},
+        6: {6: 100},
+        7: {7: 100},
+        8: {8: 100},
+        9: {9: 100}
     }
 
-    label_to_indices = {i: [] for i in range(10)}  # 记录每个类别的索引
 
-    # 收集每个类别的数据索引
+
+    # 统计每个类别的数据索引
+    label_to_indices = {i: [] for i in range(10)}  # 记录每个类别的索引
     for idx, (_, label) in enumerate(dataset):
         label_to_indices[label].append(idx)
 
-    # 为每个 client 选择对应类别的数据，并裁剪成需要的数量
-    client_datasets = []
-    for label, size in client_data_sizes.items():
-        indices = label_to_indices[label][:size]  # 取前 size 个样本
-        client_datasets.append((label, torch.utils.data.Subset(dataset, indices)))  # 存储 (类别, 数据集)
+    # 初始化客户端数据存储
+    client_data_subsets = {}
+    client_actual_sizes = {i: {label: 0 for label in range(10)} for i in range(num_clients)}  # 记录实际分配的数据量
 
-    print("📊 客户端数据分布:", client_data_sizes)
-    return client_datasets, client_data_sizes
+    # 遍历每个客户端，为其分配指定类别的数据
+    for client_id, label_info in client_data_sizes.items():
+        selected_indices = []  # 临时存储该客户端所有选中的索引
+        for label, size in label_info.items():
+            # 确保不超出类别数据集实际大小
+            available_size = len(label_to_indices[label])
+            sample_size = min(available_size, size)
+
+            if sample_size < size:
+                print(f"⚠️ 警告：类别 {label} 的数据不足，客户端 {client_id} 只能获取 {sample_size} 条样本（需求 {size} 条）")
+
+            # 从该类别中随机抽取样本
+            sampled_indices = random.sample(label_to_indices[label], sample_size)
+            selected_indices.extend(sampled_indices)
+
+            # 记录实际分配的数据量
+            client_actual_sizes[client_id][label] = sample_size
+
+        # 创建 PyTorch Subset
+        client_data_subsets[client_id] = torch.utils.data.Subset(dataset, selected_indices)
+
+    # 打印每个客户端的实际分配数据量
+    print("\n📊 每个客户端实际数据分布:")
+    for client_id, label_sizes in client_actual_sizes.items():
+        print(f"客户端 {client_id}: {label_sizes}")
+
+    return client_data_subsets, client_actual_sizes
 
 
 # 本地训练函数
-def local_train(model, train_loader, epochs=5, lr=0.001):
+def local_train(model, train_loader, epochs=5, lr=0.01):
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.SGD(model.parameters(), lr=lr)
     model.train()
@@ -110,15 +186,17 @@ def local_train(model, train_loader, epochs=5, lr=0.001):
     return model.state_dict()
 
 
-# 联邦平均聚合函数
+#  联邦平均聚合函数
 def fed_avg(global_model, client_state_dicts, client_sizes):
     global_dict = global_model.state_dict()
     subkey = [sublist[0] for sublist in client_state_dicts]
     new_client_sizes = dict(([(key, client_sizes[key]) for key in subkey]))
-    total_data = sum(new_client_sizes.values())  # 计算所有客户端数据总量
+    total_data = sum(sum(label_sizes.values()) for label_sizes in new_client_sizes.values())  # 计算所有客户端数据总量
     for key in global_dict.keys():
-        global_dict[key] = sum(client_state[key] * (client_sizes[label] / total_data)
-                               for (label, client_state) in client_state_dicts)
+        global_dict[key] = sum(
+            client_state[key] * (sum(new_client_sizes[client_id].values()) / total_data)
+            for (client_id, client_state) in client_state_dicts
+        )
     global_model.load_state_dict(global_dict)
     return global_model
 
@@ -140,39 +218,117 @@ def evaluate(model, test_loader):
     return total_loss / len(test_loader), accuracy
 
 
-# 客户端选择
-def select_clients(client_loaders, use_all_clients=True, num_select=None, select_by_loss=False, global_model=None):
-    """
-    客户端选择器：
-    - `use_all_clients=True` 时，直接选择所有客户端
-    - `use_all_clients=False` 时：
-        - `select_by_loss=True`：选择 loss 最大的 `num_select` 个客户端。
-        - `select_by_loss=False`：随机选择 `num_select` 个客户端。
-    """
+def calculate_GRC(global_model, client_models):
+
+    # 获取所有模型的参数并展平
+    all_params = []
+
+    # 首先获取全局模型参数
+    global_params = []
+    for _, param in global_model.named_parameters():
+        global_params.append(param.detach().numpy().flatten())
+    global_seq = np.concatenate(global_params)
+    all_params.append(global_seq)
+
+    # 获取所有客户端模型参数
+    client_seqs = []
+    for client_model in client_models:
+        client_params = []
+        for _, param in client_model.named_parameters():
+            client_params.append(param.detach().numpy().flatten())
+        client_seq = np.concatenate(client_params)
+        client_seqs.append(client_seq)
+        all_params.append(client_seq)
+
+    # 转换为二维数组 (11个模型 x 参数数量)
+    param_matrix = np.vstack(all_params)
+
+    # 改进的归一化方法：对每个参数位置(列)进行归一化
+    # 计算每个位置的总和(跨模型)
+    col_sums = param_matrix.sum(axis=0)
+    # 避免除以零
+    col_sums[col_sums == 0] = 1e-8
+    # 归一化
+    norm_matrix = param_matrix / col_sums
+
+    # 分离出全局和客户端序列
+    global_norm = norm_matrix[0]
+    client_norms = norm_matrix[1:]
+
+    # 计算每个客户端的GRC
+    grc_values = []
+    for client_norm in client_norms:
+        delta = np.abs(global_norm - client_norm)
+        delta_min = delta.min()
+        delta_max = delta.max()
+        rho = 0.5  # 分辨系数
+
+        epsilon = 1e-8
+        grc = (delta_min + rho * delta_max) / (delta + rho * delta_max + epsilon)
+        grc_values.append(grc.mean())
+
+    return np.array(grc_values)
+
+
+def select_clients(client_loaders, use_all_clients=False, num_select=None,
+                   select_by_loss=False, global_model=None, grc=False):
+
+    if grc is True:
+        # 批量训练所有客户端模型
+        client_models = []
+        for client_id, client_loader in client_loaders.items():
+            local_model = MLPModel()
+            local_model.load_state_dict(global_model.state_dict())
+            local_state = local_train(local_model, client_loader, epochs=1, lr=0.01)
+            client_models.append(local_model)
+
+        # 批量计算GRC
+        grc_scores = calculate_GRC(global_model, client_models)
+
+        # 创建(客户端ID, GRC)对
+        client_grc_pairs = [(client_id, score) for client_id, score in zip(client_loaders.keys(), grc_scores)]
+
+        # 按GRC从大到小排序(GRC越小差异越大)
+        client_grc_pairs.sort(key=lambda x: x[1])
+
+        # 选择GRC最小的2个客户端(差异最大的)
+        selected = [client_id for client_id, _ in client_grc_pairs[:2]]
+
+        return selected
+
+    # 其余选择逻辑保持不变
     if use_all_clients is True:
-        print("选择所有客户端")
+        print("Selecting all clients")
         return list(client_loaders.keys())
 
     if num_select is None:
-        raise ValueError("如果 use_all_clients=False, num_select 不能为空！")
+        raise ValueError("If use_all_clients=False, num_select cannot be None!")
 
     if select_by_loss and global_model:
-        # 计算每个客户端的 loss
         client_losses = {}
-        for label, loader in client_loaders.items():
+        for client_id, loader in client_loaders.items():
             loss, _ = evaluate(global_model, loader)
-            client_losses[label] = loss
+            client_losses[client_id] = loss
 
-        # loss选择
         selected_clients = sorted(client_losses, key=client_losses.get, reverse=True)[:num_select]
-        print(f"选择了 loss 最大的 {num_select} 个客户端: {selected_clients}")
-
+        print(f"Selected {num_select} clients with the highest loss: {selected_clients}")
     else:
-        # 随机选择
         selected_clients = random.sample(list(client_loaders.keys()), num_select)
-        print(f"随机选择了 {num_select} 个客户端: {selected_clients}")
+        print(f"Randomly selected {num_select} clients: {selected_clients}")
 
     return selected_clients
+
+
+def entropy_weight(X): # 输入一个列表，每个元素分别为每个client的不同特征的GRC组成的列表
+
+    P = X / X.sum(axis=0)
+
+
+    K = 1 / np.log(len(X))
+    E = -K * (P * np.log(P)).sum(axis=0)
+
+    W = (1 - E) / (1 - E).sum()
+    return W
 
 
 def update_communication_counts(communication_counts, selected_clients, event):
@@ -182,11 +338,12 @@ def update_communication_counts(communication_counts, selected_clients, event):
     - event='send' 表示客户端上传本地模型
     - event='full_round' 仅在客户端完成完整收发时增加
     """
-    for label in selected_clients:
-        communication_counts[label][event] += 1
+    for client_id in selected_clients:
+        communication_counts[client_id][event] += 1
+
         # 仅当客户端完成一次完整的 send 和 receive 时增加 full_round
-        if event == "send" and communication_counts[label]['receive'] > 0:
-            communication_counts[label]['full_round'] += 1
+        if event == "send" and communication_counts[client_id]['receive'] > 0:
+            communication_counts[client_id]['full_round'] += 1
 
 
 def main():
@@ -197,67 +354,83 @@ def main():
     # 加载 MNIST 数据集
     train_data, test_data = load_mnist_data()
 
-    # 生成客户端数据集，每个客户端只包含特定类别
+    # 生成客户端数据集，每个客户端包含多个类别
     client_datasets, client_data_sizes = split_data_by_label(train_data)
 
     # 创建数据加载器
-    client_loaders = {label: data.DataLoader(dataset, batch_size=32, shuffle=True)
-                      for label, dataset in client_datasets}
+    client_loaders = {client_id: data.DataLoader(dataset, batch_size=32, shuffle=True)
+                      for client_id, dataset in client_datasets.items()}
     test_loader = data.DataLoader(test_data, batch_size=32, shuffle=False)
 
     # 初始化全局模型
     global_model = MLPModel()
     global_accuracies = []  # 记录每轮全局模型的测试集准确率
+    total_communication_counts = []  # 记录每轮客户端通信次数
     rounds = 300  # 联邦学习轮数
-    use_all_clients = False  # 是否进行客户端选择
+    use_all_clients = True  # 是否进行客户端选择
     num_selected_clients = 2  # 每轮选择客户端训练数量
     use_loss_based_selection = True  # 是否根据 loss 选择客户端
+    grc = False
 
     # 初始化通信计数器
     communication_counts = {}
-    for label in client_loaders.keys():
-        communication_counts[label] = {
+    for client_id in client_loaders.keys():
+        communication_counts[client_id] = {
             'send': 0,  # 记录发送次数
             'receive': 0,  # 记录接收次数
             'full_round': 0  # 记录完整收发次数
         }
+    # 实验数据存储 CSV
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    csv_filename = f"training_data_{timestamp}.csv"
+    csv_data = []
 
     for r in range(rounds):
         print(f"\n🔄 第 {r + 1} 轮聚合")
         # 选择客户端
         selected_clients = select_clients(client_loaders, use_all_clients=use_all_clients,
                                           num_select=num_selected_clients,
-                                          select_by_loss=use_loss_based_selection, global_model=global_model)
-        # # 设置随机阻断某个客户端的接收
-        # blocked_client = random.choice(selected_clients)  
-        # print(f"阻断客户端 {blocked_client} 的接收，不记录receive事件")
+                                          select_by_loss=use_loss_based_selection, global_model=global_model, grc=grc)
 
-        # for label in selected_clients:
-        #     if label == blocked_client:
+        # # 设置随机阻断某个客户端的接收记录（验证用）
+        # blocked_client = random.choice(selected_clients)
+        # print(f" Blocking client {blocked_client} from receiving, skipping the receive event record.")
+
+        # for client_id in selected_clients:
+        #     if client_id == blocked_client:
         #         continue  # 直接跳过 receive 记录
-        #     update_communication_counts(communication_counts, [label], "receive")
+        #     update_communication_counts(communication_counts, [client_id], "receive")
 
         # 记录客户端接收通信次数
         update_communication_counts(communication_counts, selected_clients, "receive")
         client_state_dicts = []
 
         # 客户端本地训练
-        for label in selected_clients:
-            client_loader = client_loaders[label]
+        for client_id in selected_clients:
+            client_loader = client_loaders[client_id]
             local_model = MLPModel()
             local_model.load_state_dict(global_model.state_dict())  # 复制全局模型参数
             local_state = local_train(local_model, client_loader, epochs=1, lr=0.01)  # 训练 1 轮
-            client_state_dicts.append((label, local_state))  # 存储 (类别, 训练后的参数)
-            update_communication_counts(communication_counts, [label], "send")  # 记录客户端上报通信次数
+            client_state_dicts.append((client_id, local_state))  # 存储 (客户端ID, 训练后的参数)
 
-            # param_mean = {name: param.mean().item() for name, param in local_model.named_parameters()}
-            print(f"  ✅ 客户端 {label} (类别 {label}) 训练完成 | 样本数量: {client_data_sizes[label]}")
-            # print(f"  📌 客户端 {label} 模型参数均值: {param_mean}")
+            update_communication_counts(communication_counts, [client_id], "send")  # 记录客户端上报通信次数
+
+            param_mean = {name: param.mean().item() for name, param in local_model.named_parameters()}
+            print(f"  ✅ 客户端 {client_id} 训练完成 | 样本数量: {sum(client_data_sizes[client_id].values())}")
+            print(f"  📌 客户端 {client_id} 模型参数均值: {param_mean}")
+
+        # 计算本轮通信次数
+        total_send = sum(
+            communication_counts[c]['send'] - (communication_counts[c]['full_round'] - 1) for c in selected_clients)
+        total_receive = sum(
+            communication_counts[c]['receive'] - (communication_counts[c]['full_round'] - 1) for c in selected_clients)
+        total_comm = total_send + total_receive  # 每轮独立的总通信次数
+        total_communication_counts.append(total_comm)  # 记录当前轮的通信次数
 
         # 聚合模型参数
         global_model = fed_avg(global_model, client_state_dicts, client_data_sizes)
 
-        # 计算全局模型参数平均值
+        # # 计算全局模型参数平均值
         # global_param_mean = {name: param.mean().item() for name, param in global_model.named_parameters()}
         # print(f"🔄 轮 {r + 1} 结束后，全局模型参数均值: {global_param_mean}")
 
@@ -266,22 +439,49 @@ def main():
         global_accuracies.append(accuracy)
         print(f"📊 测试集损失: {loss:.4f} | 测试集准确率: {accuracy:.2f}%")
 
+        # 记录数据到 CSV
+        csv_data.append([
+            r + 1,
+            accuracy,
+            total_comm,
+            ",".join(map(str, selected_clients))
+        ])
+
+    # 保存数据到 CSV 文件
+    df = pd.DataFrame(csv_data, columns=[
+        'Round', 'Accuracy', 'Total communication counts', 'Selected Clients'
+    ])
+    df.to_csv(csv_filename, index=False)
+    print(f"训练数据已保存至 {csv_filename}")
+
     # 输出最终模型的性能
     final_loss, final_accuracy = evaluate(global_model, test_loader)
     print(f"\n🎯 Loss of final model test dataset: {final_loss:.4f}")
     print(f"🎯 Final model test set accuracy: {final_accuracy:.2f}%")
 
     # 输出通信记录
-    print("\n 客户端通信统计:")
-    for label, counts in communication_counts.items():
-        print(f"客户端 {label}: 发送 {counts['send']} 次, 接收 {counts['receive']} 次, 完整收发 {counts['full_round']} 次")
+    print("\n Client Communication Statistics:")
+    for client_id, counts in communication_counts.items():
+        print(
+            f"Client {client_id}: Sent {counts['send']} times, Received {counts['receive']} times, Completed full_round {counts['full_round']} times")
 
-    # 可视化全局模型准确率的变化
+    # 可视化全局模型准确率 vs 轮次
     plt.figure(figsize=(8, 5))
     plt.plot(range(1, rounds + 1), global_accuracies, marker='o', linestyle='-', color='b', label="Test Accuracy")
     plt.xlabel("Federated Learning Rounds")
     plt.ylabel("Accuracy")
-    plt.title("Global Model Accuracy Over Training Rounds")
+    plt.title("Test Accuracy Over Federated Learning Rounds")
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
+    # 可视化全局模型准确率 vs 客户端完整通信次数
+    plt.figure(figsize=(8, 5))
+    plt.plot(total_communication_counts, global_accuracies, marker='s', linestyle='-', color='r',
+             label="Test Accuracy vs. Communication")
+    plt.xlabel("Total Communication Count per Round")
+    plt.ylabel("Accuracy")
+    plt.title("Test Accuracy vs. Total Communication")
     plt.legend()
     plt.grid(True)
     plt.show()
