@@ -218,76 +218,119 @@ def evaluate(model, test_loader):
     return total_loss / len(test_loader), accuracy
 
 
-def calculate_GRC(global_model, client_models):
+def entropy_weight(l):
+    weight = []
+    for X in l:
 
-    # 获取所有模型的参数并展平
-    all_params = []
+        P = X / X.sum(axis=0)
 
-    # 首先获取全局模型参数
-    global_params = []
-    for _, param in global_model.named_parameters():
-        global_params.append(param.detach().numpy().flatten())
-    global_seq = np.concatenate(global_params)
-    all_params.append(global_seq)
+        K = 1 / np.log(len(X))
+        E = -K * (P * np.log(P + 1e-12)).sum(axis=0)
 
-    # 获取所有客户端模型参数
-    client_seqs = []
-    for client_model in client_models:
-        client_params = []
-        for _, param in client_model.named_parameters():
-            client_params.append(param.detach().numpy().flatten())
-        client_seq = np.concatenate(client_params)
-        client_seqs.append(client_seq)
-        all_params.append(client_seq)
+        W = (1 - E) / (1 - E).sum()
+        weight.append(W)
+    return weight
 
-    # 转换为二维数组 (11个模型 x 参数数量)
-    param_matrix = np.vstack(all_params)
 
-    # 改进的归一化方法：对每个参数位置(列)进行归一化
-    # 计算每个位置的总和(跨模型)
-    col_sums = param_matrix.sum(axis=0)
-    # 避免除以零
-    col_sums[col_sums == 0] = 1e-8
-    # 归一化
-    norm_matrix = param_matrix / col_sums
+def calculate_GRC(global_model, client_models, client_losses):
+    """
+    计算客户端的 GRC 分数。
 
-    # 分离出全局和客户端序列
-    global_norm = norm_matrix[0]
-    client_norms = norm_matrix[1:]
+    参数:
+        global_model (nn.Module): 全局模型。
+        client_models (list): 客户端本地模型列表。
+        client_losses (list): 客户端训练损失列表。
 
-    # 计算每个客户端的GRC
-    grc_values = []
-    for client_norm in client_norms:
-        delta = np.abs(global_norm - client_norm)
-        delta_min = delta.min()
-        delta_max = delta.max()
-        rho = 0.5  # 分辨系数
+    返回:
+        list: 每个客户端的 GRC 分数。
+    """
+    # 1. 构建参考序列（理想值：损失=0，模型参数差异=0）
+    ref_loss = 0.0
+    ref_param_diff = 0.0
 
-        epsilon = 1e-8
-        grc = (delta_min + rho * delta_max) / (delta + rho * delta_max + epsilon)
-        grc_values.append(grc.mean())
+    # 2. 计算客户端指标
+    param_diffs = []
+    for model in client_models:
+        diff = 0.0
+        for g_param, l_param in zip(global_model.parameters(), model.parameters()):
+            diff += torch.norm(g_param - l_param).item()  # 参数差异（L2范数）
+        param_diffs.append(diff)
 
-    return np.array(grc_values)
+    # 3. 对 losses 和 diffs 进行 mapping
+    def map_sequence(sequence):
+        max_val = max(sequence)
+        min_val = min(sequence)
+        return [(max_val + x) / (max_val + min_val) for x in sequence]
+
+    client_losses = map_sequence(client_losses)  # 映射后的 losses
+    param_diffs = map_sequence(param_diffs)  # 映射后的 diffs
+
+
+    max_loss = max(client_losses)
+    max_diff = max(param_diffs)
+
+
+    # 4. 计算全局极值
+    all_deltas = []
+    for nl, nd in zip(client_losses, param_diffs):
+        all_deltas.append(abs(nl - max_loss))  # 损失差值
+        all_deltas.append(abs(nd - max_diff))  # 参数差异差值
+    max_delta = max(all_deltas)  # 全局最大值
+    min_delta = min(all_deltas)  # 全局最小值
+
+    # 5. 计算 GRC（分辨系数 ρ=0.5）
+    grc_scores = []
+    grc_losses = []
+    grc_diffs = []
+    for nl, nd in zip(client_losses, param_diffs):
+        delta_loss = abs(nl - max_loss)
+        delta_diff = abs(nd - max_diff)
+
+        # 灰色关联系数公式
+        grc_loss = (min_delta + 0.5 * max_delta) / (delta_loss + 0.5 * max_delta)
+        grc_diff = (min_delta + 0.5 * max_delta) / (delta_diff + 0.5 * max_delta)
+
+        grc_losses.append(grc_loss)
+        grc_diffs.append(grc_diff)
+
+    # 将 grc_loss 和 grc_diff 组合成指标矩阵 (n_clients × 2)
+    grc_metrics = np.array([client_losses, param_diffs])
+
+    # 计算熵权法权重
+    weights = entropy_weight(grc_metrics)  # 形如 [w_loss, w_diff]
+
+
+
+    weighted_score = grc_losses / weights[0] + grc_diffs / weights[1]
+
+
+    return weighted_score
 
 
 def select_clients(client_loaders, use_all_clients=False, num_select=None,
                    select_by_loss=False, global_model=None, grc=False):
-
-    if grc is True:
+    if grc:  # 使用 GRC 选择客户端
         client_models = []
+
+        # 1. 训练本地模型并计算损失
+        client_losses = []
         for client_id, client_loader in client_loaders.items():
             local_model = MLPModel()
-            local_model.load_state_dict(global_model.state_dict())
+            local_model.load_state_dict(global_model.state_dict())  # 同步全局模型
             local_state = local_train(local_model, client_loader, epochs=1, lr=0.01)
             client_models.append(local_model)
-        grc_scores = calculate_GRC(global_model, client_models)
+            loss, _ = evaluate(global_model, client_loader)
+            client_losses.append(loss)
 
-        client_grc_pairs = [(client_id, score) for client_id, score in zip(client_loaders.keys(), grc_scores)]
+        # 2. 计算 GRC 分数
+        grc_scores = calculate_GRC(global_model, client_models, client_losses)
 
-        client_grc_pairs.sort(key=lambda x: x[1])
+        # 3. 按 GRC 分数排序（从高到低，GRC越高表示越好）
+        client_grc_pairs = list(zip(client_loaders.keys(), grc_scores))
+        client_grc_pairs.sort(key=lambda x: x[1], reverse=True)  # 降序排序
 
-        selected = [client_id for client_id, _ in client_grc_pairs[:2]]
-
+        # 4. 选择 GRC 最高的前 num_select 个客户端
+        selected = [client_id for client_id, _ in client_grc_pairs[:num_select]]
         return selected
 
     # 其余选择逻辑保持不变
@@ -312,17 +355,6 @@ def select_clients(client_loaders, use_all_clients=False, num_select=None,
 
     return selected_clients
 
-
-def entropy_weight(X): # 输入一个列表，每个元素分别为每个client的不同特征的GRC组成的列表
-
-    P = X / X.sum(axis=0)
-
-
-    K = 1 / np.log(len(X))
-    E = -K * (P * np.log(P)).sum(axis=0)
-
-    W = (1 - E) / (1 - E).sum()
-    return W
 
 
 def update_communication_counts(communication_counts, selected_clients, event):
@@ -364,7 +396,7 @@ def main():
     use_all_clients = False  # 是否进行客户端选择
     num_selected_clients = 2  # 每轮选择客户端训练数量
     use_loss_based_selection = True  # 是否根据 loss 选择客户端
-    grc = False
+    grc = True
 
     # 初始化通信计数器
     communication_counts = {}
@@ -482,144 +514,144 @@ def main():
     plt.show()
 
 
-def main2():
-    torch.manual_seed(0)
-    random.seed(0)
-    np.random.seed(0)
-
-    # 加载 MNIST 数据集
-    train_data, test_data = load_mnist_data()
-
-    # 生成客户端数据集，每个客户端包含多个类别
-    client_datasets, client_data_sizes = split_data_by_label(train_data)
-
-    # 创建数据加载器
-    client_loaders = {client_id: data.DataLoader(dataset, batch_size=32, shuffle=True)
-                      for client_id, dataset in client_datasets.items()}
-    test_loader = data.DataLoader(test_data, batch_size=32, shuffle=False)
-
-    # 初始化全局模型
-    global_model = MLPModel()
-    global_accuracies = []
-    total_communication_counts = []
-    rounds = 300
-    use_all_clients = False
-    num_selected_clients = 2
-    use_loss_based_selection = True
-    grc = False
-
-    # 初始化通信计数器
-    communication_counts = {}
-    for client_id in client_loaders.keys():
-        communication_counts[client_id] = {
-            'send': 0,
-            'receive': 0,
-            'full_round': 0
-        }
-
-    # 新增：用于记录客户端历史loss
-    client_loss_history = {client_id: [] for client_id in client_loaders.keys()}
-    client_selection_history = []  # 记录每轮选择的客户端
-
-    # 实验数据存储 CSV
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    csv_filename = f"training_data_{timestamp}.csv"
-    csv_data = []
-
-    for r in range(rounds):
-        print(f"\n🔄 第 {r + 1} 轮聚合")
-
-        # 选择客户端
-        if r % 3 == 0:
-            # 每3轮计算一次所有客户端的loss
-            current_losses = {}
-            for client_id, loader in client_loaders.items():
-                loss, _ = evaluate(global_model, loader)
-                current_losses[client_id] = loss
-                client_loss_history[client_id].append(loss)
-
-            # 对于最近被选中的客户端，使用加权平均loss
-            weighted_losses = {}
-            for client_id in client_loaders.keys():
-                if len(client_selection_history) > 0 and client_id in client_selection_history[-1]:
-                    # 最近被选中的客户端，计算加权平均loss
-                    history = client_loss_history[client_id][-3:]  # 取最近3次loss
-                    weights = [0.5, 0.3, 0.2]  # 加权系数，最近的最重要
-                    weighted_loss = sum(h * w for h, w in zip(history, weights)) / sum(weights)
-                    weighted_losses[client_id] = weighted_loss
-                else:
-                    # 其他客户端使用当前loss
-                    weighted_losses[client_id] = current_losses[client_id]
-
-            # 选择loss最大的2个客户端
-            selected_clients = sorted(weighted_losses, key=weighted_losses.get, reverse=True)[:num_selected_clients]
-            print(f"Selected {num_selected_clients} clients with the highest weighted loss: {selected_clients}")
-
-        client_selection_history.append(selected_clients)  # 记录选择历史
-
-        # 记录客户端接收通信次数
-        update_communication_counts(communication_counts, selected_clients, "receive")
-        client_state_dicts = []
-
-        # 客户端本地训练
-        for client_id in selected_clients:
-            client_loader = client_loaders[client_id]
-            local_model = MLPModel()
-            local_model.load_state_dict(global_model.state_dict())
-            local_state = local_train(local_model, client_loader, epochs=1, lr=0.01)
-            client_state_dicts.append((client_id, local_state))
-
-            update_communication_counts(communication_counts, [client_id], "send")
-
-            param_mean = {name: param.mean().item() for name, param in local_model.named_parameters()}
-            print(f"  ✅ 客户端 {client_id} 训练完成 | 样本数量: {sum(client_data_sizes[client_id].values())}")
-
-        # 计算本轮通信次数
-        total_send = sum(
-            communication_counts[c]['send'] - (communication_counts[c]['full_round'] - 1) for c in selected_clients)
-        total_receive = sum(
-            communication_counts[c]['receive'] - (communication_counts[c]['full_round'] - 1) for c in
-            selected_clients)
-        total_comm = total_send + total_receive
-        total_communication_counts.append(total_comm)
-
-        # 聚合模型参数
-        global_model = fed_avg(global_model, client_state_dicts, client_data_sizes)
-
-        # 评估模型
-        loss, accuracy = evaluate(global_model, test_loader)
-        global_accuracies.append(accuracy)
-        print(f"📊 测试集损失: {loss:.4f} | 测试集准确率: {accuracy:.2f}%")
-
-        # 记录数据到 CSV
-        csv_data.append([
-            r + 1,
-            accuracy,
-            total_comm,
-            ",".join(map(str, selected_clients))
-        ])
-
-    # 保存数据到 CSV 文件
-    df = pd.DataFrame(csv_data, columns=[
-        'Round', 'Accuracy', 'Total communication counts', 'Selected Clients'
-    ])
-    df.to_csv(csv_filename, index=False)
-    print(f"训练数据已保存至 {csv_filename}")
-
-    # 输出最终模型的性能
-    final_loss, final_accuracy = evaluate(global_model, test_loader)
-    print(f"\n🎯 Loss of final model test dataset: {final_loss:.4f}")
-    print(f"🎯 Final model test set accuracy: {final_accuracy:.2f}%")
-
-    # 可视化结果
-    plt.figure(figsize=(8, 5))
-    plt.plot(range(1, rounds + 1), global_accuracies, marker='o', linestyle='-', color='b', label="Test Accuracy")
-    plt.xlabel("Federated Learning Rounds")
-    plt.ylabel("Accuracy")
-    plt.title("Test Accuracy Over Federated Learning Rounds")
-    plt.legend()
-    plt.grid(True)
-    plt.show()
+# def main2():
+#     torch.manual_seed(0)
+#     random.seed(0)
+#     np.random.seed(0)
+#
+#     # 加载 MNIST 数据集
+#     train_data, test_data = load_mnist_data()
+#
+#     # 生成客户端数据集，每个客户端包含多个类别
+#     client_datasets, client_data_sizes = split_data_by_label(train_data)
+#
+#     # 创建数据加载器
+#     client_loaders = {client_id: data.DataLoader(dataset, batch_size=32, shuffle=True)
+#                       for client_id, dataset in client_datasets.items()}
+#     test_loader = data.DataLoader(test_data, batch_size=32, shuffle=False)
+#
+#     # 初始化全局模型
+#     global_model = MLPModel()
+#     global_accuracies = []
+#     total_communication_counts = []
+#     rounds = 300
+#     use_all_clients = False
+#     num_selected_clients = 2
+#     use_loss_based_selection = True
+#     grc = False
+#
+#     # 初始化通信计数器
+#     communication_counts = {}
+#     for client_id in client_loaders.keys():
+#         communication_counts[client_id] = {
+#             'send': 0,
+#             'receive': 0,
+#             'full_round': 0
+#         }
+#
+#     # 新增：用于记录客户端历史loss
+#     client_loss_history = {client_id: [] for client_id in client_loaders.keys()}
+#     client_selection_history = []  # 记录每轮选择的客户端
+#
+#     # 实验数据存储 CSV
+#     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+#     csv_filename = f"training_data_{timestamp}.csv"
+#     csv_data = []
+#
+#     for r in range(rounds):
+#         print(f"\n🔄 第 {r + 1} 轮聚合")
+#
+#         # 选择客户端
+#         if r % 3 == 0:
+#             # 每3轮计算一次所有客户端的loss
+#             current_losses = {}
+#             for client_id, loader in client_loaders.items():
+#                 loss, _ = evaluate(global_model, loader)
+#                 current_losses[client_id] = loss
+#                 client_loss_history[client_id].append(loss)
+#
+#             # 对于最近被选中的客户端，使用加权平均loss
+#             weighted_losses = {}
+#             for client_id in client_loaders.keys():
+#                 if len(client_selection_history) > 0 and client_id in client_selection_history[-1]:
+#                     # 最近被选中的2个client，计算加权平均loss
+#                     history = client_loss_history[client_id][-3:]
+#                     weights = [0.5, 0.25, 0.25]
+#                     weighted_loss = sum(h * w for h, w in zip(history, weights)) / sum(weights)
+#                     weighted_losses[client_id] = weighted_loss
+#                 else:
+#                     # 其他客户端使用当前loss
+#                     weighted_losses[client_id] = current_losses[client_id]
+#
+#             # 选择loss最大的2个客户端
+#             selected_clients = sorted(weighted_losses, key=weighted_losses.get, reverse=True)[:num_selected_clients]
+#             print(f"Selected {num_selected_clients} clients with the highest weighted loss: {selected_clients}")
+#
+#         client_selection_history.append(selected_clients)  # 记录选择历史
+#
+#         # 记录客户端接收通信次数
+#         update_communication_counts(communication_counts, selected_clients, "receive")
+#         client_state_dicts = []
+#
+#         # 客户端本地训练
+#         for client_id in selected_clients:
+#             client_loader = client_loaders[client_id]
+#             local_model = MLPModel()
+#             local_model.load_state_dict(global_model.state_dict())
+#             local_state = local_train(local_model, client_loader, epochs=1, lr=0.01)
+#             client_state_dicts.append((client_id, local_state))
+#
+#             update_communication_counts(communication_counts, [client_id], "send")
+#
+#             param_mean = {name: param.mean().item() for name, param in local_model.named_parameters()}
+#             print(f"  ✅ 客户端 {client_id} 训练完成 | 样本数量: {sum(client_data_sizes[client_id].values())}")
+#
+#         # 计算本轮通信次数
+#         total_send = sum(
+#             communication_counts[c]['send'] - (communication_counts[c]['full_round'] - 1) for c in selected_clients)
+#         total_receive = sum(
+#             communication_counts[c]['receive'] - (communication_counts[c]['full_round'] - 1) for c in
+#             selected_clients)
+#         total_comm = total_send + total_receive
+#         total_communication_counts.append(total_comm)
+#
+#         # 聚合模型参数
+#         global_model = fed_avg(global_model, client_state_dicts, client_data_sizes)
+#
+#         # 评估模型
+#         loss, accuracy = evaluate(global_model, test_loader)
+#         global_accuracies.append(accuracy)
+#         print(f"📊 测试集损失: {loss:.4f} | 测试集准确率: {accuracy:.2f}%")
+#
+#         # 记录数据到 CSV
+#         csv_data.append([
+#             r + 1,
+#             accuracy,
+#             total_comm,
+#             ",".join(map(str, selected_clients))
+#         ])
+#
+#     # 保存数据到 CSV 文件
+#     df = pd.DataFrame(csv_data, columns=[
+#         'Round', 'Accuracy', 'Total communication counts', 'Selected Clients'
+#     ])
+#     df.to_csv(csv_filename, index=False)
+#     print(f"训练数据已保存至 {csv_filename}")
+#
+#     # 输出最终模型的性能
+#     final_loss, final_accuracy = evaluate(global_model, test_loader)
+#     print(f"\n🎯 Loss of final model test dataset: {final_loss:.4f}")
+#     print(f"🎯 Final model test set accuracy: {final_accuracy:.2f}%")
+#
+#     # 可视化结果
+#     plt.figure(figsize=(8, 5))
+#     plt.plot(range(1, rounds + 1), global_accuracies, marker='o', linestyle='-', color='b', label="Test Accuracy")
+#     plt.xlabel("Federated Learning Rounds")
+#     plt.ylabel("Accuracy")
+#     plt.title("Test Accuracy Over Federated Learning Rounds")
+#     plt.legend()
+#     plt.grid(True)
+#     plt.show()
 
 
 if __name__ == "__main__":
@@ -631,3 +663,4 @@ if __name__ == "__main__":
 # 10 loss choose per 3 times
 # 11 prc choose per 3 times
 # 12 loss weight mean choose per 3 times
+# 13 new GRG
