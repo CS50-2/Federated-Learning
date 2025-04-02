@@ -66,35 +66,79 @@ def visualize_mnist_samples(dataset, num_samples=10):
     plt.show()
 
 # 分割 MNIST 数据，使每个客户端只包含某个数字类别
-def split_data_by_label(dataset):
-    # 自定义每个类别的数据量
+def split_data_by_label(dataset, num_clients=10):
+    
+    # Mannually set each client'id and corresponding dataset distribution 
     client_data_sizes = {
-        0: 5000,
-        1: 7000,
-        2: 6000,
-        3: 8000,
-        4: 4000,
-        5: 9000,
-        6: 3000,
-        7: 10000,
-        8: 7500,
-        9: 6500
+        0: {0: 600, 1: 700, 2: 600, 3: 600, 4: 500, 5: 500, 6: 100, 7: 100, 8: 100, 9: 100},
+        1: {0: 700, 1: 600, 2: 600, 3: 600, 4: 500, 5: 100, 6: 100, 7: 100, 8: 100, 9: 600},
+        2: {0: 500, 1: 600, 2: 700, 3: 600, 4: 100, 5: 100, 6: 100, 7: 100, 8: 600, 9: 500},
+        3: {0: 600, 1: 600, 2: 500, 3: 100, 4: 100, 5: 100, 6: 100, 7: 500, 8: 500, 9: 700},
+        4: {0: 600, 1: 500, 2: 100, 3: 100, 4: 100, 5: 100, 6: 600, 7: 700, 8: 500, 9: 500},
+        5: {0: 500, 1: 100, 2: 100, 3: 100, 4: 100, 5: 600, 6: 500, 7: 600, 8: 700, 9: 600},
+        6: {0: 100, 1: 100, 2: 100, 3: 100, 4: 700, 5: 500, 6: 600, 7: 500, 8: 500, 9: 600},
+        7: {0: 100, 1: 100, 2: 100, 3: 600, 4: 500, 5: 600, 6: 500, 7: 600, 8: 500, 9: 100},
+        8: {0: 100, 1: 100, 2: 500, 3: 500, 4: 600, 5: 500, 6: 600, 7: 500, 8: 100, 9: 100},
+        9: {0: 100, 1: 700, 2: 600, 3: 600, 4: 600, 5: 500, 6: 600, 7: 100, 8: 100, 9: 100}
     }
 
-    label_to_indices = {i: [] for i in range(10)}  # 记录每个类别的索引
+    # Initialize an empty dictionary to store indices for each label (from 0 to 9) 
+    label_to_indices = {}
 
-    # 收集每个类别的数据索引
-    for idx, (_, label) in enumerate(dataset):
-        label_to_indices[label].append(idx)
+    for label in range(10):
+        label_to_indices[label] = []  
 
-    # 为每个 client 选择对应类别的数据，并裁剪成需要的数量
-    client_datasets = []
-    for label, size in client_data_sizes.items():
-        indices = label_to_indices[label][:size]  # 取前 size 个样本
-        client_datasets.append((label, torch.utils.data.Subset(dataset, indices)))  # 存储 (类别, 数据集)
+    # Loop through the dataset using enumerate to get both the index and the data item.
+    # Each data item is a tuple (image, label).
+    for index, (_, label) in enumerate(dataset):
+        # Append the current index to the list corresponding to the data's label.
+        label_to_indices[label].append(index)
 
-    print("📊 客户端数据分布:", client_data_sizes)
-    return client_datasets, client_data_sizes
+    # Create an empty dictionary to store the data subset for each client.
+    client_data_subsets = {}
+
+    # Initialize a dictionary to record the actual number of samples allocated for each label in each client.
+    client_actual_sizes = {}
+    for client_id in range(num_clients):
+        # For each client, initialize an empty dictionary to store the sample counts for labels 0 to 9.
+        client_actual_sizes[client_id] = {}
+        
+        # For each label from 0 to 9, set the initial count to 0.
+        for label in range(10):
+            client_actual_sizes[client_id][label] = 0
+    
+    # Iterate over each client and assign data for the specified labels.
+    for client_id, label_info in client_data_sizes.items():
+        selected_indices = []
+        
+        for label, required_size in label_info.items():
+            available_size = len(label_to_indices[label])
+            
+            # Determine the number of samples to select
+            sample_size = min(available_size, required_size)
+            
+            # If the available sample size is less than the required size, print a warning message.
+            if sample_size < required_size:
+                print(f"⚠️ Warning: Not enough data for label {label}. Client {client_id} can only get {sample_size} samples (required {required_size}).")
+            
+            # Randomly select the determined number of indices and add the selected indices to the client's list.
+            sampled_indices = random.sample(label_to_indices[label], sample_size)
+            selected_indices.extend(sampled_indices)
+            
+            # Record the actual number of samples allocated for this label for the current client.
+            client_actual_sizes[client_id][label] = sample_size
+        
+        # Create a PyTorch Subset for this client using the selected indices.
+        client_data_subsets[client_id] = torch.utils.data.Subset(dataset, selected_indices)
+
+
+    print("\n📊 Actual data distribution per client:")
+    for client_id, label_sizes in client_actual_sizes.items():
+        print(f"Client {client_id}: {label_sizes}")
+
+    # Return both the client data subsets and the dictionary of actual sample sizes.
+    return client_data_subsets, client_actual_sizes
+
 
 # 本地训练函数
 def local_train(model, train_loader, epochs=5, lr=0.01):
@@ -162,13 +206,13 @@ def main():
     for r in range(rounds):
         print(f"\n=== Round {r+1} FedAvg ===")
 
-        # (a) First, measure the average loss of each client under the current global model
+        # First, measure the average loss of each client under the current global model
         client_losses = {}
         for label, loader in client_loaders.items():
             loss_val = evaluate(global_model, loader)
             client_losses[label] = loss_val
 
-        # (b) Sort the clients by loss in descending order, and select the top 2
+        # Sort the clients by loss in descending order, and select the top 2
         sorted_clients = sorted(client_losses.items(), key=lambda x: x[1], reverse=True)
         top2 = sorted_clients[:2]  # top 2 (label, lossValue)
         selected_clients = [item[0] for item in top2]  # extract only the labels
@@ -176,7 +220,7 @@ def main():
         print("    All clients' loss:", client_losses)
         print("    Top 2 clients with the highest loss:", selected_clients)
 
-        # (c) Perform local training on these two selected clients
+        # Perform local training on these two selected clients
         client_state_dicts = []
         selected_client_sizes = {}
         for label in selected_clients:
@@ -185,16 +229,16 @@ def main():
             updated_params = local_train(
                 local_model,
                 client_loaders[label],
-                epochs=1,   # you can increase this for more local training
-                lr=0.01     # you can tune this learning rate
+                epochs=1,   
+                lr=0.01     
             )
             client_state_dicts.append((label, updated_params))
             selected_client_sizes[label] = client_data_sizes[label]  # needed for weighted FedAvg
 
-        # (d) Aggregate with FedAvg
+        # Aggregate with FedAvg
         fed_avg(global_model, client_state_dicts, selected_client_sizes)
 
-        # (e) Evaluate the current global model on the test set
+        # Evaluate the current global model on the test set
         loss, acc = evaluate(global_model, test_loader)
         print(f"  [Round {r+1}] Test Loss = {loss:.4f}, Test Acc = {acc:.2f}%")
 
