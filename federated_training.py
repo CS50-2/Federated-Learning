@@ -115,7 +115,7 @@ def fed_avg(global_model, client_state_dicts, client_sizes):
     global_dict = global_model.state_dict()
     total_data = sum(client_sizes.values())  # 计算所有客户端数据总量
     for key in global_dict.keys():
-        global_dict[key] = sum(client_state[key] * (client_sizes[label] / total_data)
+        global_dict[key] = sum(client_state[key] * (client_sizes[label] / total_data) # 
                                for (label, client_state) in client_state_dicts)
     global_model.load_state_dict(global_dict)
     return global_model

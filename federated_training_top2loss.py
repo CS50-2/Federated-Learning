@@ -18,6 +18,8 @@ import random
 import os
 import matplotlib.pyplot as plt
 import ssl 
+from datetime import datetime
+import pandas as pd
 
 
 # 定义 MLP 模型
@@ -157,10 +159,24 @@ def local_train(model, train_loader, epochs=5, lr=0.01):
 # 联邦平均聚合函数
 def fed_avg(global_model, client_state_dicts, client_sizes):
     global_dict = global_model.state_dict()
-    total_data = sum(client_sizes.values())  # 计算所有客户端数据总量
+    
+    # Extract client IDs from client_state_dicts tuples.
+    subkey = [sublist[0] for sublist in client_state_dicts]
+    
+    # Create a new dictionary of client sizes using only the clients that were selected.
+    new_client_sizes = dict([(key, client_sizes[key]) for key in subkey])
+    
+    # Calculate the total number of samples across all selected clients.
+    # Here, each client size is now assumed to be a nested dictionary (per label), so we sum the values for each client.
+    total_data = sum(sum(label_sizes.values()) for label_sizes in new_client_sizes.values())
+    
+    # Update each parameter in the global model.
     for key in global_dict.keys():
-        global_dict[key] = sum(client_state[key] * (client_sizes[label] / total_data)
-                               for (label, client_state) in client_state_dicts)
+        global_dict[key] = sum(
+            client_state[key] * (sum(new_client_sizes[client_id].values()) / total_data)
+            for (client_id, client_state) in client_state_dicts
+        )
+    
     global_model.load_state_dict(global_dict)
     return global_model
 
@@ -180,6 +196,158 @@ def evaluate(model, test_loader):
     accuracy = correct / total * 100
     return total_loss / len(test_loader), accuracy
 
+def entropy_weight(l):
+    weight = []
+    for X in l:
+
+        P = X / X.sum(axis=0)
+
+        K = 1 / np.log(len(X))
+        E = -K * (P * np.log(P + 1e-12)).sum(axis=0)
+        weight.append(E)
+    one_minus_weight = [1 - w for w in weight]
+    sum_one_minus_weight = sum(one_minus_weight)
+    new_weight = [w / sum_one_minus_weight for w in one_minus_weight]
+
+    return new_weight
+
+
+def calculate_GRC(global_model, client_models, client_losses):
+    """
+    Calculate the Grey Relational Coefficient (GRC) scores for each client.
+    
+    Parameters:
+        global_model (nn.Module): The global model.
+        client_models (list): A list of client local models.
+        client_losses (list): A list of training losses for each client.
+    
+    Returns:
+        list: The GRC score for each client.
+    """
+    # Construct reference sequences (ideal values: loss=0, parameter difference=0)
+    ref_loss = 0.0
+    ref_param_diff = 0.0
+
+    # Compute client metrics: calculate the L2 norm difference between the global model and each client model (parameter differences)
+    param_diffs = []
+    for model in client_models:
+        diff = 0.0
+        for g_param, l_param in zip(global_model.parameters(), model.parameters()):
+            diff += torch.norm(g_param - l_param).item()  # Compute L2 norm difference for each parameter
+        param_diffs.append(diff)
+
+    # Normalize (map) both the client losses and parameter differences.
+    def map_sequence(sequence):
+        max_val = max(sequence)
+        min_val = min(sequence)
+        # Normalize each value using the formula: (max_val + x) / (max_val + min_val)
+        return [(max_val + x) / (max_val + min_val) for x in sequence]
+
+    client_losses = map_sequence(client_losses)  # Normalized client losses
+    param_diffs = map_sequence(param_diffs)      # Normalized parameter differences
+
+    # Get the maximum values from the normalized losses and differences
+    max_loss = max(client_losses)
+    max_diff = max(param_diffs)
+
+    # Calculate global extreme differences across all clients and metrics
+    all_deltas = []
+    for nl, nd in zip(client_losses, param_diffs):
+        all_deltas.append(abs(nl - max_loss))  # Absolute deviation for loss
+        all_deltas.append(abs(nd - max_diff))  # Absolute deviation for parameter difference
+    max_delta = max(all_deltas)  # Global maximum deviation (∆max)
+    min_delta = min(all_deltas)  # Global minimum deviation (∆min)
+
+    # Compute the Grey Relational Coefficients (GRC) for each metric using ρ = 0.5
+    grc_losses = []  # GRC values for loss
+    grc_diffs = []   # GRC values for parameter differences
+    for nl, nd in zip(client_losses, param_diffs):
+        delta_loss = abs(nl - max_loss)
+        delta_diff = abs(nd - max_diff)
+        
+        # Apply the GRC formula:
+        # GRC = (∆min + ρ∆max) / (∆ki + ρ∆max)
+        grc_loss = (min_delta + 0.5 * max_delta) / (delta_loss + 0.5 * max_delta)
+        grc_diff = (min_delta + 0.5 * max_delta) / (delta_diff + 0.5 * max_delta)
+        
+        grc_losses.append(grc_loss)
+        grc_diffs.append(grc_diff)
+
+    # Combine the normalized metrics into a matrix (2 x n_clients)
+    grc_metrics = np.array([client_losses, param_diffs])
+
+    # Compute entropy weights for each metric (returns weights for loss and parameter differences)
+    weights = entropy_weight(grc_metrics)  # Expected output: [w_loss, w_diff]
+
+    # Compute the final weighted GRC score for each client by combining the GRC values for loss and parameter differences
+    weighted_score = grc_losses / weights[0] + grc_diffs / weights[1]
+
+    return weighted_score
+
+
+def select_clients(client_loaders, use_all_clients=False, num_select=None,
+                   select_by_loss=False, global_model=None, grc=False):
+    if grc:
+        client_models = []
+
+        client_losses = []
+        for client_id, client_loader in client_loaders.items():
+            local_model = MLPModel()
+            local_model.load_state_dict(global_model.state_dict())
+            local_state = local_train(local_model, client_loader, epochs=1, lr=0.01)
+            client_models.append(local_model)
+            loss, _ = evaluate(global_model, client_loader)
+            client_losses.append(loss)
+
+
+        grc_scores = calculate_GRC(global_model, client_models, client_losses)
+
+
+        client_grc_pairs = list(zip(client_loaders.keys(), grc_scores))
+        client_grc_pairs.sort(key=lambda x: x[1], reverse=True)
+
+
+        selected = [client_id for client_id, _ in client_grc_pairs[:num_select]]
+        return selected
+
+    # 其余选择逻辑保持不变
+    if use_all_clients is True:
+        print("Selecting all clients")
+        return list(client_loaders.keys())
+
+    if num_select is None:
+        raise ValueError("If use_all_clients=False, num_select cannot be None!")
+
+    if select_by_loss and global_model:
+        client_losses = {}
+        for client_id, loader in client_loaders.items():
+            loss, _ = evaluate(global_model, loader)
+            client_losses[client_id] = loss
+
+        selected_clients = sorted(client_losses, key=client_losses.get, reverse=True)[:num_select]
+        print(f"Selected {num_select} clients with the highest loss: {selected_clients}")
+    else:
+        selected_clients = random.sample(list(client_loaders.keys()), num_select)
+        print(f"Randomly selected {num_select} clients: {selected_clients}")
+
+    return selected_clients
+
+
+def update_communication_counts(communication_counts, selected_clients, event):
+    """
+    客户端通信计数
+    - event='receive' 表示客户端接收到全局模型
+    - event='send' 表示客户端上传本地模型
+    - event='full_round' 仅在客户端完成完整收发时增加
+    """
+    for client_id in selected_clients:
+        communication_counts[client_id][event] += 1
+
+        # 仅当客户端完成一次完整的 send 和 receive 时增加 full_round
+        if event == "send" and communication_counts[client_id]['receive'] > 0:
+            communication_counts[client_id]['full_round'] += 1
+
+
 def main():
     torch.manual_seed(0)
     random.seed(0)
@@ -192,63 +360,125 @@ def main():
     client_datasets, client_data_sizes = split_data_by_label(train_data)
 
     # 创建数据加载器
-    client_loaders = {label: data.DataLoader(dataset, batch_size=32, shuffle=True)
-                      for label, dataset in client_datasets}
+    client_loaders = {client_id: data.DataLoader(dataset, batch_size=32, shuffle=True)
+                      for client_id, dataset in client_datasets.items()}
     test_loader = data.DataLoader(test_data, batch_size=32, shuffle=False)
 
     # 初始化全局模型
     global_model = MLPModel()
+    global_accuracies = []  # 记录每轮全局模型的测试集准确率
+    total_communication_counts = []  # 记录每轮客户端通信次数
+    rounds = 300  # 联邦学习轮数
+    use_all_clients = False  # 是否进行客户端选择
+    num_selected_clients = 2  # 每轮选择客户端训练数量
+    use_loss_based_selection = True  # 是否根据 loss 选择客户端
+    grc = True
 
-    ###################### changed by TAIGE for top two loss client training ###########################
+    # 初始化通信计数器
+    communication_counts = {}
+    for client_id in client_loaders.keys():
+        communication_counts[client_id] = {
+            'send': 0,  # 记录发送次数
+            'receive': 0,  # 记录接收次数
+            'full_round': 0  # 记录完整收发次数
+        }
+    # 实验数据存储 CSV
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    csv_filename = f"training_data_{timestamp}.csv"
+    csv_data = []
 
-    # 4. Federated training
-    rounds = 100
     for r in range(rounds):
-        print(f"\n=== Round {r+1} FedAvg ===")
+        print(f"\n🔄 第 {r + 1} 轮聚合")
+        # 选择客户端
+        if r % 3 == 0:
+            selected_clients = select_clients(client_loaders, use_all_clients=use_all_clients,
+                                          num_select=num_selected_clients,
+                                          select_by_loss=use_loss_based_selection, global_model=global_model, grc=grc)
 
-        # First, measure the average loss of each client under the current global model
-        client_losses = {}
-        for label, loader in client_loaders.items():
-            loss_val = evaluate(global_model, loader)
-            client_losses[label] = loss_val
-
-        # Sort the clients by loss in descending order, and select the top 2
-        sorted_clients = sorted(client_losses.items(), key=lambda x: x[1], reverse=True)
-        top2 = sorted_clients[:2]  # top 2 (label, lossValue)
-        selected_clients = [item[0] for item in top2]  # extract only the labels
-
-        print("    All clients' loss:", client_losses)
-        print("    Top 2 clients with the highest loss:", selected_clients)
-
-        # Perform local training on these two selected clients
+        # 记录客户端接收通信次数
+        update_communication_counts(communication_counts, selected_clients, "receive")
         client_state_dicts = []
-        selected_client_sizes = {}
-        for label in selected_clients:
+
+        # 客户端本地训练
+        for client_id in selected_clients:
+            client_loader = client_loaders[client_id]
             local_model = MLPModel()
-            local_model.load_state_dict(global_model.state_dict())  # copy the global model parameters
-            updated_params = local_train(
-                local_model,
-                client_loaders[label],
-                epochs=1,   
-                lr=0.01     
-            )
-            client_state_dicts.append((label, updated_params))
-            selected_client_sizes[label] = client_data_sizes[label]  # needed for weighted FedAvg
+            local_model.load_state_dict(global_model.state_dict())  # 复制全局模型参数
+            local_state = local_train(local_model, client_loader, epochs=1, lr=0.01)  # 训练 1 轮
+            client_state_dicts.append((client_id, local_state))  # 存储 (客户端ID, 训练后的参数)
 
-        # Aggregate with FedAvg
-        fed_avg(global_model, client_state_dicts, selected_client_sizes)
+            update_communication_counts(communication_counts, [client_id], "send")  # 记录客户端上报通信次数
 
-        # Evaluate the current global model on the test set
-        loss, acc = evaluate(global_model, test_loader)
-        print(f"  [Round {r+1}] Test Loss = {loss:.4f}, Test Acc = {acc:.2f}%")
+            param_mean = {name: param.mean().item() for name, param in local_model.named_parameters()}
+            print(f"  ✅ 客户端 {client_id} 训练完成 | 样本数量: {sum(client_data_sizes[client_id].values())}")
+            print(f"  📌 客户端 {client_id} 模型参数均值: {param_mean}")
 
+        # 计算本轮通信次数
+        total_send = sum(
+            communication_counts[c]['send'] - (communication_counts[c]['full_round'] - 1) for c in selected_clients)
+        total_receive = sum(
+            communication_counts[c]['receive'] - (communication_counts[c]['full_round'] - 1) for c in selected_clients)
+        total_comm = total_send + total_receive  # 每轮独立的总通信次数
+        total_communication_counts.append(total_comm)  # 记录当前轮的通信次数
 
-        ##########################################################################################
+        # 聚合模型参数
+        global_model = fed_avg(global_model, client_state_dicts, client_data_sizes)
+
+        # # 计算全局模型参数平均值
+        # global_param_mean = {name: param.mean().item() for name, param in global_model.named_parameters()}
+        # print(f"🔄 轮 {r + 1} 结束后，全局模型参数均值: {global_param_mean}")
+
+        # 评估模型
+        loss, accuracy = evaluate(global_model, test_loader)
+        global_accuracies.append(accuracy)
+        print(f"📊 测试集损失: {loss:.4f} | 测试集准确率: {accuracy:.2f}%")
+
+        # 记录数据到 CSV
+        csv_data.append([
+            r + 1,
+            accuracy,
+            total_comm,
+            ",".join(map(str, selected_clients))
+        ])
+
+    # 保存数据到 CSV 文件
+    df = pd.DataFrame(csv_data, columns=[
+        'Round', 'Accuracy', 'Total communication counts', 'Selected Clients'
+    ])
+    df.to_csv(csv_filename, index=False)
+    print(f"训练数据已保存至 {csv_filename}")
 
     # 输出最终模型的性能
     final_loss, final_accuracy = evaluate(global_model, test_loader)
     print(f"\n🎯 Loss of final model test dataset: {final_loss:.4f}")
     print(f"🎯 Final model test set accuracy: {final_accuracy:.2f}%")
+
+    # 输出通信记录
+    print("\n Client Communication Statistics:")
+    for client_id, counts in communication_counts.items():
+        print(
+            f"Client {client_id}: Sent {counts['send']} times, Received {counts['receive']} times, Completed full_round {counts['full_round']} times")
+
+       # 可视化全局模型准确率 vs 轮次
+    plt.figure(figsize=(8, 5))
+    plt.plot(range(1, rounds + 1), global_accuracies, marker='o', linestyle='-', color='b', label="Test Accuracy")
+    plt.xlabel("Federated Learning Rounds")
+    plt.ylabel("Accuracy")
+    plt.title("Test Accuracy Over Federated Learning Rounds")
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
+    # 可视化全局模型准确率 vs 客户端完整通信次数
+    plt.figure(figsize=(8, 5))
+    plt.plot(total_communication_counts, global_accuracies, marker='s', linestyle='-', color='r',
+             label="Test Accuracy vs. Communication")
+    plt.xlabel("Total Communication Count per Round")
+    plt.ylabel("Accuracy")
+    plt.title("Test Accuracy vs. Total Communication")
+    plt.legend()
+    plt.grid(True)
+    plt.show()
 
 if __name__ == "__main__":
     main()
