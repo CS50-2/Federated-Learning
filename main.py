@@ -105,31 +105,31 @@ def split_data_by_label(dataset, num_clients=10):
     :return: (客户端数据集, 客户端数据大小)
     """
     # 手动划分的样本数量（每个客户端 10 个类别的数据量）
-    # client_data_sizes = {
-    #     0: {0: 600, 1: 700, 2: 600, 3: 600, 4: 500, 5: 500, 6: 100, 7: 100, 8: 100, 9: 100},
-    #     1: {0: 700, 1: 600, 2: 600, 3: 600, 4: 500, 5: 100, 6: 100, 7: 100, 8: 100, 9: 600},
-    #     2: {0: 500, 1: 600, 2: 700, 3: 600, 4: 100, 5: 100, 6: 100, 7: 100, 8: 600, 9: 500},
-    #     3: {0: 600, 1: 600, 2: 500, 3: 100, 4: 100, 5: 100, 6: 100, 7: 500, 8: 500, 9: 700},
-    #     4: {0: 600, 1: 500, 2: 100, 3: 100, 4: 100, 5: 100, 6: 600, 7: 700, 8: 500, 9: 500},
-    #     5: {0: 500, 1: 100, 2: 100, 3: 100, 4: 100, 5: 600, 6: 500, 7: 600, 8: 700, 9: 600},
-    #     6: {0: 100, 1: 100, 2: 100, 3: 100, 4: 700, 5: 500, 6: 600, 7: 500, 8: 500, 9: 600},
-    #     7: {0: 100, 1: 100, 2: 100, 3: 600, 4: 500, 5: 600, 6: 500, 7: 600, 8: 500, 9: 100},
-    #     8: {0: 100, 1: 100, 2: 500, 3: 500, 4: 600, 5: 500, 6: 600, 7: 500, 8: 100, 9: 100},
-    #     9: {0: 100, 1: 700, 2: 600, 3: 600, 4: 600, 5: 500, 6: 600, 7: 100, 8: 100, 9: 100}
-    # }
-
     client_data_sizes = {
-        0: {0: 600},
-        1: {1: 700},
-        2: {2: 500},
-        3: {3: 600},
-        4: {4: 600},
-        5: {5: 500},
-        6: {6: 100},
-        7: {7: 100},
-        8: {8: 100},
-        9: {9: 100}
+        0: {0: 600, 1: 700, 2: 600, 3: 600, 4: 500, 5: 500, 6: 100, 7: 100, 8: 100, 9: 100},
+        1: {0: 700, 1: 600, 2: 600, 3: 600, 4: 500, 5: 100, 6: 100, 7: 100, 8: 100, 9: 600},
+        2: {0: 500, 1: 600, 2: 700, 3: 600, 4: 100, 5: 100, 6: 100, 7: 100, 8: 600, 9: 500},
+        3: {0: 600, 1: 600, 2: 500, 3: 100, 4: 100, 5: 100, 6: 100, 7: 500, 8: 500, 9: 700},
+        4: {0: 600, 1: 500, 2: 100, 3: 100, 4: 100, 5: 100, 6: 600, 7: 700, 8: 500, 9: 500},
+        5: {0: 500, 1: 100, 2: 100, 3: 100, 4: 100, 5: 600, 6: 500, 7: 600, 8: 700, 9: 600},
+        6: {0: 100, 1: 100, 2: 100, 3: 100, 4: 700, 5: 500, 6: 600, 7: 500, 8: 500, 9: 600},
+        7: {0: 100, 1: 100, 2: 100, 3: 600, 4: 500, 5: 600, 6: 500, 7: 600, 8: 500, 9: 100},
+        8: {0: 100, 1: 100, 2: 500, 3: 500, 4: 600, 5: 500, 6: 600, 7: 500, 8: 100, 9: 100},
+        9: {0: 100, 1: 700, 2: 600, 3: 600, 4: 600, 5: 500, 6: 600, 7: 100, 8: 100, 9: 100}
     }
+
+    # client_data_sizes = {
+    #     0: {0: 600},
+    #     1: {1: 700},
+    #     2: {2: 500},
+    #     3: {3: 600},
+    #     4: {4: 600},
+    #     5: {5: 500},
+    #     6: {6: 100},
+    #     7: {7: 100},
+    #     8: {8: 100},
+    #     9: {9: 100}
+    # }
 
 
 
@@ -226,10 +226,12 @@ def entropy_weight(l):
 
         K = 1 / np.log(len(X))
         E = -K * (P * np.log(P + 1e-12)).sum(axis=0)
+        weight.append(E)
+    one_minus_weight = [1 - w for w in weight]
+    sum_one_minus_weight = sum(one_minus_weight)
+    new_weight = [w / sum_one_minus_weight for w in one_minus_weight]
 
-        W = (1 - E) / (1 - E).sum()
-        weight.append(W)
-    return weight
+    return new_weight
 
 
 def calculate_GRC(global_model, client_models, client_losses):
@@ -309,27 +311,27 @@ def calculate_GRC(global_model, client_models, client_losses):
 
 def select_clients(client_loaders, use_all_clients=False, num_select=None,
                    select_by_loss=False, global_model=None, grc=False):
-    if grc:  # 使用 GRC 选择客户端
+    if grc:
         client_models = []
 
-        # 1. 训练本地模型并计算损失
+
         client_losses = []
         for client_id, client_loader in client_loaders.items():
             local_model = MLPModel()
-            local_model.load_state_dict(global_model.state_dict())  # 同步全局模型
+            local_model.load_state_dict(global_model.state_dict())
             local_state = local_train(local_model, client_loader, epochs=1, lr=0.01)
             client_models.append(local_model)
             loss, _ = evaluate(global_model, client_loader)
             client_losses.append(loss)
 
-        # 2. 计算 GRC 分数
+
         grc_scores = calculate_GRC(global_model, client_models, client_losses)
 
-        # 3. 按 GRC 分数排序（从高到低，GRC越高表示越好）
-        client_grc_pairs = list(zip(client_loaders.keys(), grc_scores))
-        client_grc_pairs.sort(key=lambda x: x[1], reverse=True)  # 降序排序
 
-        # 4. 选择 GRC 最高的前 num_select 个客户端
+        client_grc_pairs = list(zip(client_loaders.keys(), grc_scores))
+        client_grc_pairs.sort(key=lambda x: x[1], reverse=True)
+
+
         selected = [client_id for client_id, _ in client_grc_pairs[:num_select]]
         return selected
 
