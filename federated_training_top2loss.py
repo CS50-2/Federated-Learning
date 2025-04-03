@@ -420,7 +420,7 @@ def run_experiment(selection_method, rounds=100, num_selected_clients=2):
 def main_experiments():
     # Assume client_loaders, client_data_sizes, test_loader, etc., are already defined.
     
-    rounds = 50
+    rounds = 200
     # Run experiments for each method
     df_fedGRA = run_experiment("fedGRA", rounds, num_selected_clients=2)
     df_high_loss = run_experiment("high_loss", rounds, num_selected_clients=2)
