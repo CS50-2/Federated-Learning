@@ -54,18 +54,7 @@ def load_mnist_data(data_path="./data"):
     train_data = datasets.MNIST(root=data_path, train=True, transform=transform, download=True)
     test_data = datasets.MNIST(root=data_path, train=False, transform=transform, download=True)
 
-    visualize_mnist_samples(train_data)
     return train_data, test_data
-
-# 显示数据集示例图片
-def visualize_mnist_samples(dataset, num_samples=10):
-    fig, axes = plt.subplots(1, num_samples, figsize=(num_samples * 1.2, 1.5))
-    for i in range(num_samples):
-        img, label = dataset[i]
-        axes[i].imshow(img.squeeze(), cmap="gray")
-        axes[i].set_title(label)
-        axes[i].axis("off")
-    plt.show()
 
 # 分割 MNIST 数据，使每个客户端只包含某个数字类别
 def split_data_by_label(dataset, num_clients=10):
@@ -347,8 +336,7 @@ def update_communication_counts(communication_counts, selected_clients, event):
         if event == "send" and communication_counts[client_id]['receive'] > 0:
             communication_counts[client_id]['full_round'] += 1
 
-
-def main():
+def run_experiment(selection_method, rounds=100, num_selected_clients=2):
     torch.manual_seed(0)
     random.seed(0)
     np.random.seed(0)
@@ -364,121 +352,233 @@ def main():
                       for client_id, dataset in client_datasets.items()}
     test_loader = data.DataLoader(test_data, batch_size=32, shuffle=False)
 
-    # 初始化全局模型
+    # Initialize global model, communication_counts, and results storage
     global_model = MLPModel()
-    global_accuracies = []  # 记录每轮全局模型的测试集准确率
-    total_communication_counts = []  # 记录每轮客户端通信次数
-    rounds = 300  # 联邦学习轮数
-    use_all_clients = False  # 是否进行客户端选择
-    num_selected_clients = 2  # 每轮选择客户端训练数量
-    use_loss_based_selection = True  # 是否根据 loss 选择客户端
-    grc = True
-
-    # 初始化通信计数器
-    communication_counts = {}
-    for client_id in client_loaders.keys():
-        communication_counts[client_id] = {
-            'send': 0,  # 记录发送次数
-            'receive': 0,  # 记录接收次数
-            'full_round': 0  # 记录完整收发次数
-        }
-    # 实验数据存储 CSV
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    csv_filename = f"training_data_{timestamp}.csv"
+    global_accuracies = []
+    total_communication_counts = []
     csv_data = []
 
-    for r in range(rounds):
-        print(f"\n🔄 第 {r + 1} 轮聚合")
-        # 选择客户端
-        if r % 3 == 0:
-            selected_clients = select_clients(client_loaders, use_all_clients=use_all_clients,
-                                          num_select=num_selected_clients,
-                                          select_by_loss=use_loss_based_selection, global_model=global_model, grc=grc)
+    # Initialize communication counters for all clients
+    communication_counts = {client_id: {'send': 0, 'receive': 0, 'full_round': 0}
+                            for client_id in client_loaders.keys()}
 
-        # 记录客户端接收通信次数
+    for r in range(rounds):
+        print(f"\nRound {r+1}")
+        
+        # Select clients based on the specified method:
+        if selection_method == "fedGRA":
+            selected_clients = select_clients(client_loaders, use_all_clients=False,
+                                              num_select=num_selected_clients,
+                                              select_by_loss=True, global_model=global_model, grc=True)
+        elif selection_method == "high_loss":
+            # Use loss-based selection without GRC (select top 2 highest loss clients)
+            selected_clients = select_clients(client_loaders, use_all_clients=False,
+                                              num_select=num_selected_clients,
+                                              select_by_loss=True, global_model=global_model, grc=False)
+        elif selection_method == "fedavg":
+            # Use FedAvg with either random selection or all clients.
+            # Here we assume using all clients or random selection for FedAvg.
+            selected_clients = list(client_loaders.keys())  # Or random.sample(...)
+
+        # Record receive communication count
         update_communication_counts(communication_counts, selected_clients, "receive")
         client_state_dicts = []
 
-        # 客户端本地训练
+        # Perform local training on selected clients
         for client_id in selected_clients:
             client_loader = client_loaders[client_id]
             local_model = MLPModel()
-            local_model.load_state_dict(global_model.state_dict())  # 复制全局模型参数
-            local_state = local_train(local_model, client_loader, epochs=1, lr=0.01)  # 训练 1 轮
-            client_state_dicts.append((client_id, local_state))  # 存储 (客户端ID, 训练后的参数)
+            local_model.load_state_dict(global_model.state_dict())
+            local_train(local_model, client_loader, epochs=1, lr=0.01)
+            client_state_dicts.append((client_id, local_model.state_dict()))
+            update_communication_counts(communication_counts, [client_id], "send")
+            print(f"Client {client_id} trained.")
 
-            update_communication_counts(communication_counts, [client_id], "send")  # 记录客户端上报通信次数
+        # Compute communication counts for this round
+        total_send = sum(communication_counts[c]['send'] - (communication_counts[c]['full_round'] - 1)
+                         for c in selected_clients)
+        total_receive = sum(communication_counts[c]['receive'] - (communication_counts[c]['full_round'] - 1)
+                            for c in selected_clients)
+        total_comm = total_send + total_receive
+        total_communication_counts.append(total_comm)
 
-            param_mean = {name: param.mean().item() for name, param in local_model.named_parameters()}
-            print(f"  ✅ 客户端 {client_id} 训练完成 | 样本数量: {sum(client_data_sizes[client_id].values())}")
-            print(f"  📌 客户端 {client_id} 模型参数均值: {param_mean}")
-
-        # 计算本轮通信次数
-        total_send = sum(
-            communication_counts[c]['send'] - (communication_counts[c]['full_round'] - 1) for c in selected_clients)
-        total_receive = sum(
-            communication_counts[c]['receive'] - (communication_counts[c]['full_round'] - 1) for c in selected_clients)
-        total_comm = total_send + total_receive  # 每轮独立的总通信次数
-        total_communication_counts.append(total_comm)  # 记录当前轮的通信次数
-
-        # 聚合模型参数
+        # Aggregate model updates
         global_model = fed_avg(global_model, client_state_dicts, client_data_sizes)
 
-        # # 计算全局模型参数平均值
-        # global_param_mean = {name: param.mean().item() for name, param in global_model.named_parameters()}
-        # print(f"🔄 轮 {r + 1} 结束后，全局模型参数均值: {global_param_mean}")
-
-        # 评估模型
+        # Evaluate global model
         loss, accuracy = evaluate(global_model, test_loader)
         global_accuracies.append(accuracy)
-        print(f"📊 测试集损失: {loss:.4f} | 测试集准确率: {accuracy:.2f}%")
+        print(f"Test Accuracy: {accuracy:.2f}%")
+        
+        # Save round data; add a column indicating the method used if desired.
+        csv_data.append([r+1, accuracy, total_comm])
 
-        # 记录数据到 CSV
-        csv_data.append([
-            r + 1,
-            accuracy,
-            total_comm,
-            ",".join(map(str, selected_clients))
-        ])
+    # Convert collected data to a DataFrame
+    df = pd.DataFrame(csv_data, columns=['Round', f'Accuracy_{selection_method}', f'Comm_{selection_method}'])
+    return df
 
-    # 保存数据到 CSV 文件
-    df = pd.DataFrame(csv_data, columns=[
-        'Round', 'Accuracy', 'Total communication counts', 'Selected Clients'
-    ])
-    df.to_csv(csv_filename, index=False)
-    print(f"训练数据已保存至 {csv_filename}")
-
-    # 输出最终模型的性能
-    final_loss, final_accuracy = evaluate(global_model, test_loader)
-    print(f"\n🎯 Loss of final model test dataset: {final_loss:.4f}")
-    print(f"🎯 Final model test set accuracy: {final_accuracy:.2f}%")
-
-    # 输出通信记录
-    print("\n Client Communication Statistics:")
-    for client_id, counts in communication_counts.items():
-        print(
-            f"Client {client_id}: Sent {counts['send']} times, Received {counts['receive']} times, Completed full_round {counts['full_round']} times")
-
-       # 可视化全局模型准确率 vs 轮次
-    plt.figure(figsize=(8, 5))
-    plt.plot(range(1, rounds + 1), global_accuracies, marker='o', linestyle='-', color='b', label="Test Accuracy")
-    plt.xlabel("Federated Learning Rounds")
-    plt.ylabel("Accuracy")
-    plt.title("Test Accuracy Over Federated Learning Rounds")
-    plt.legend()
-    plt.grid(True)
-    plt.show()
-
-    # 可视化全局模型准确率 vs 客户端完整通信次数
-    plt.figure(figsize=(8, 5))
-    plt.plot(total_communication_counts, global_accuracies, marker='s', linestyle='-', color='r',
-             label="Test Accuracy vs. Communication")
-    plt.xlabel("Total Communication Count per Round")
-    plt.ylabel("Accuracy")
-    plt.title("Test Accuracy vs. Total Communication")
+def main_experiments():
+    # Assume client_loaders, client_data_sizes, test_loader, etc., are already defined.
+    
+    rounds = 50
+    # Run experiments for each method
+    df_fedGRA = run_experiment("fedGRA", rounds, num_selected_clients=2)
+    df_high_loss = run_experiment("high_loss", rounds, num_selected_clients=2)
+    df_fedavg = run_experiment("fedavg", rounds, num_selected_clients=2)
+    
+    # Merge DataFrames on 'Round'
+    df_combined = df_fedGRA.merge(df_high_loss, on='Round').merge(df_fedavg, on='Round')
+    
+    # Save to CSV for later inspection if needed
+    df_combined.to_csv("comparison_results.csv", index=False)
+    
+    # Plot comparison: For example, plot Accuracy over Rounds for each method.
+    plt.figure(figsize=(10,6))
+    plt.plot(df_combined['Round'], df_combined['Accuracy_fedGRA'], marker='o', label='FedGRA')
+    plt.plot(df_combined['Round'], df_combined['Accuracy_high_loss'], marker='s', label='High-Loss Filtering')
+    plt.plot(df_combined['Round'], df_combined['Accuracy_fedavg'], marker='^', label='FedAvg')
+    plt.xlabel("Rounds")
+    plt.ylabel("Test Accuracy (%)")
+    plt.title("Comparison of FedGRA, High-Loss Filtering, and FedAvg")
     plt.legend()
     plt.grid(True)
     plt.show()
 
 if __name__ == "__main__":
-    main()
+    main_experiments()
+
+
+# def main():
+#     torch.manual_seed(0)
+#     random.seed(0)
+#     np.random.seed(0)
+
+#     # 加载 MNIST 数据集
+#     train_data, test_data = load_mnist_data()
+
+#     # 生成客户端数据集，每个客户端只包含特定类别
+#     client_datasets, client_data_sizes = split_data_by_label(train_data)
+
+#     # 创建数据加载器
+#     client_loaders = {client_id: data.DataLoader(dataset, batch_size=32, shuffle=True)
+#                       for client_id, dataset in client_datasets.items()}
+#     test_loader = data.DataLoader(test_data, batch_size=32, shuffle=False)
+
+#     # 初始化全局模型
+#     global_model = MLPModel()
+#     global_accuracies = []  # 记录每轮全局模型的测试集准确率
+#     total_communication_counts = []  # 记录每轮客户端通信次数
+#     rounds = 300  # 联邦学习轮数
+#     use_all_clients = False  # 是否进行客户端选择
+#     num_selected_clients = 2  # 每轮选择客户端训练数量
+#     use_loss_based_selection = True  # 是否根据 loss 选择客户端
+#     grc = True
+
+#     # 初始化通信计数器
+#     communication_counts = {}
+#     for client_id in client_loaders.keys():
+#         communication_counts[client_id] = {
+#             'send': 0,  # 记录发送次数
+#             'receive': 0,  # 记录接收次数
+#             'full_round': 0  # 记录完整收发次数
+#         }
+#     # 实验数据存储 CSV
+#     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+#     csv_filename = f"training_data_{timestamp}.csv"
+#     csv_data = []
+
+#     for r in range(rounds):
+#         print(f"\n🔄 第 {r + 1} 轮聚合")
+#         # 选择客户端
+#         if r % 3 == 0:
+#             selected_clients = select_clients(client_loaders, use_all_clients=use_all_clients,
+#                                           num_select=num_selected_clients,
+#                                           select_by_loss=use_loss_based_selection, global_model=global_model, grc=grc)
+
+#         # 记录客户端接收通信次数
+#         update_communication_counts(communication_counts, selected_clients, "receive")
+#         client_state_dicts = []
+
+#         # 客户端本地训练
+#         for client_id in selected_clients:
+#             client_loader = client_loaders[client_id]
+#             local_model = MLPModel()
+#             local_model.load_state_dict(global_model.state_dict())  # 复制全局模型参数
+#             local_state = local_train(local_model, client_loader, epochs=1, lr=0.01)  # 训练 1 轮
+#             client_state_dicts.append((client_id, local_state))  # 存储 (客户端ID, 训练后的参数)
+
+#             update_communication_counts(communication_counts, [client_id], "send")  # 记录客户端上报通信次数
+
+#             param_mean = {name: param.mean().item() for name, param in local_model.named_parameters()}
+#             print(f"  ✅ 客户端 {client_id} 训练完成 | 样本数量: {sum(client_data_sizes[client_id].values())}")
+#             print(f"  📌 客户端 {client_id} 模型参数均值: {param_mean}")
+
+#         # 计算本轮通信次数
+#         total_send = sum(
+#             communication_counts[c]['send'] - (communication_counts[c]['full_round'] - 1) for c in selected_clients)
+#         total_receive = sum(
+#             communication_counts[c]['receive'] - (communication_counts[c]['full_round'] - 1) for c in selected_clients)
+#         total_comm = total_send + total_receive  # 每轮独立的总通信次数
+#         total_communication_counts.append(total_comm)  # 记录当前轮的通信次数
+
+#         # 聚合模型参数
+#         global_model = fed_avg(global_model, client_state_dicts, client_data_sizes)
+
+#         # # 计算全局模型参数平均值
+#         # global_param_mean = {name: param.mean().item() for name, param in global_model.named_parameters()}
+#         # print(f"🔄 轮 {r + 1} 结束后，全局模型参数均值: {global_param_mean}")
+
+#         # 评估模型
+#         loss, accuracy = evaluate(global_model, test_loader)
+#         global_accuracies.append(accuracy)
+#         print(f"📊 测试集损失: {loss:.4f} | 测试集准确率: {accuracy:.2f}%")
+
+#         # 记录数据到 CSV
+#         csv_data.append([
+#             r + 1,
+#             accuracy,
+#             total_comm,
+#             ",".join(map(str, selected_clients))
+#         ])
+
+#     # 保存数据到 CSV 文件
+#     df = pd.DataFrame(csv_data, columns=[
+#         'Round', 'Accuracy', 'Total communication counts', 'Selected Clients'
+#     ])
+#     df.to_csv(csv_filename, index=False)
+#     print(f"训练数据已保存至 {csv_filename}")
+
+#     # 输出最终模型的性能
+#     final_loss, final_accuracy = evaluate(global_model, test_loader)
+#     print(f"\n🎯 Loss of final model test dataset: {final_loss:.4f}")
+#     print(f"🎯 Final model test set accuracy: {final_accuracy:.2f}%")
+
+#     # 输出通信记录
+#     print("\n Client Communication Statistics:")
+#     for client_id, counts in communication_counts.items():
+#         print(
+#             f"Client {client_id}: Sent {counts['send']} times, Received {counts['receive']} times, Completed full_round {counts['full_round']} times")
+
+#        # 可视化全局模型准确率 vs 轮次
+#     plt.figure(figsize=(8, 5))
+#     plt.plot(range(1, rounds + 1), global_accuracies, marker='o', linestyle='-', color='b', label="Test Accuracy")
+#     plt.xlabel("Federated Learning Rounds")
+#     plt.ylabel("Accuracy")
+#     plt.title("Test Accuracy Over Federated Learning Rounds")
+#     plt.legend()
+#     plt.grid(True)
+#     plt.show()
+
+#     # 可视化全局模型准确率 vs 客户端完整通信次数
+#     plt.figure(figsize=(8, 5))
+#     plt.plot(total_communication_counts, global_accuracies, marker='s', linestyle='-', color='r',
+#              label="Test Accuracy vs. Communication")
+#     plt.xlabel("Total Communication Count per Round")
+#     plt.ylabel("Accuracy")
+#     plt.title("Test Accuracy vs. Total Communication")
+#     plt.legend()
+#     plt.grid(True)
+#     plt.show()
+
+# if __name__ == "__main__":
+#     main()
