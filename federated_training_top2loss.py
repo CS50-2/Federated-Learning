@@ -431,18 +431,6 @@ def main_experiments():
     
     # Save to CSV for later inspection if needed
     df_combined.to_csv("comparison_results.csv", index=False)
-    
-    # Plot comparison: For example, plot Accuracy over Rounds for each method.
-    plt.figure(figsize=(10,6))
-    plt.plot(df_combined['Round'], df_combined['Accuracy_fedGRA'], marker='o', label='FedGRA')
-    plt.plot(df_combined['Round'], df_combined['Accuracy_high_loss'], marker='s', label='High-Loss Filtering')
-    plt.plot(df_combined['Round'], df_combined['Accuracy_fedavg'], marker='^', label='FedAvg')
-    plt.xlabel("Rounds")
-    plt.ylabel("Test Accuracy (%)")
-    plt.title("Comparison of FedGRA, High-Loss Filtering, and FedAvg")
-    plt.legend()
-    plt.grid(True)
-    plt.show()
 
 if __name__ == "__main__":
     main_experiments()
