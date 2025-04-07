@@ -105,30 +105,43 @@ def split_data_by_label(dataset, num_clients=10):
     :return: (客户端数据集, 客户端数据大小)
     """
     # 手动划分的样本数量（每个客户端 10 个类别的数据量）
+    # client_data_sizes = {
+    #     0: {0: 600, 1: 700, 2: 600, 3: 600, 4: 500, 5: 500, 6: 100, 7: 100, 8: 100, 9: 100},
+    #     1: {0: 700, 1: 600, 2: 600, 3: 600, 4: 500, 5: 100, 6: 100, 7: 100, 8: 100, 9: 600},
+    #     2: {0: 500, 1: 600, 2: 700, 3: 600, 4: 100, 5: 100, 6: 100, 7: 100, 8: 600, 9: 500},
+    #     3: {0: 600, 1: 600, 2: 500, 3: 100, 4: 100, 5: 100, 6: 100, 7: 500, 8: 500, 9: 700},
+    #     4: {0: 600, 1: 500, 2: 100, 3: 100, 4: 100, 5: 100, 6: 600, 7: 700, 8: 500, 9: 500},
+    #     5: {0: 500, 1: 100, 2: 100, 3: 100, 4: 100, 5: 600, 6: 500, 7: 600, 8: 700, 9: 600},
+    #     6: {0: 100, 1: 100, 2: 100, 3: 100, 4: 700, 5: 500, 6: 600, 7: 500, 8: 500, 9: 600},
+    #     7: {0: 100, 1: 100, 2: 100, 3: 600, 4: 500, 5: 600, 6: 500, 7: 600, 8: 500, 9: 100},
+    #     8: {0: 100, 1: 100, 2: 500, 3: 500, 4: 600, 5: 500, 6: 600, 7: 500, 8: 100, 9: 100},
+    #     9: {0: 100, 1: 700, 2: 600, 3: 600, 4: 600, 5: 500, 6: 600, 7: 100, 8: 100, 9: 100}
+    # }
+
     client_data_sizes = {
-        0: {0: 600, 1: 700, 2: 600, 3: 600, 4: 500, 5: 500, 6: 100, 7: 100, 8: 100, 9: 100},
-        1: {0: 700, 1: 600, 2: 600, 3: 600, 4: 500, 5: 100, 6: 100, 7: 100, 8: 100, 9: 600},
-        2: {0: 500, 1: 600, 2: 700, 3: 600, 4: 100, 5: 100, 6: 100, 7: 100, 8: 600, 9: 500},
-        3: {0: 600, 1: 600, 2: 500, 3: 100, 4: 100, 5: 100, 6: 100, 7: 500, 8: 500, 9: 700},
-        4: {0: 600, 1: 500, 2: 100, 3: 100, 4: 100, 5: 100, 6: 600, 7: 700, 8: 500, 9: 500},
-        5: {0: 500, 1: 100, 2: 100, 3: 100, 4: 100, 5: 600, 6: 500, 7: 600, 8: 700, 9: 600},
-        6: {0: 100, 1: 100, 2: 100, 3: 100, 4: 700, 5: 500, 6: 600, 7: 500, 8: 500, 9: 600},
-        7: {0: 100, 1: 100, 2: 100, 3: 600, 4: 500, 5: 600, 6: 500, 7: 600, 8: 500, 9: 100},
-        8: {0: 100, 1: 100, 2: 500, 3: 500, 4: 600, 5: 500, 6: 600, 7: 500, 8: 100, 9: 100},
-        9: {0: 100, 1: 700, 2: 600, 3: 600, 4: 600, 5: 500, 6: 600, 7: 100, 8: 100, 9: 100}
+        0: {0: 150},
+        1: {1: 150},
+        2: {2: 150},
+        3: {3: 150},
+        4: {4: 150},
+        5: {5: 150},
+        6: {6: 150},
+        7: {7: 150},
+        8: {8: 150},
+        9: {9: 150}
     }
 
     # client_data_sizes = {
-    #     0: {0: 600},
-    #     1: {1: 700},
-    #     2: {2: 500},
-    #     3: {3: 600},
-    #     4: {4: 600},
-    #     5: {5: 500},
-    #     6: {6: 100},
-    #     7: {7: 100},
-    #     8: {8: 100},
-    #     9: {9: 100}
+    #     0: {0: 600, 1: 700, 2: 600},
+    #     1: {1: 600, 2: 600, 3: 600},
+    #     2: {2: 700, 3: 600, 4: 100},
+    #     3: {3: 100, 4: 100, 5: 100},
+    #     4: {4: 100, 5: 100, 6: 600},
+    #     5: {5: 600, 6: 500, 7: 600},
+    #     6: {6: 600, 7: 500, 8: 500},
+    #     7: {7: 600, 8: 500, 9: 100},
+    #     8: {0: 100, 8: 100, 9: 100},
+    #     9: {0: 100, 1: 700, 9: 100}
     # }
 
 
@@ -173,6 +186,8 @@ def split_data_by_label(dataset, num_clients=10):
 
 # 本地训练函数
 def local_train(model, train_loader, epochs=5, lr=0.01):
+    torch.manual_seed(1)
+    random.seed(1)
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.SGD(model.parameters(), lr=lr)
     model.train()
@@ -201,6 +216,44 @@ def fed_avg(global_model, client_state_dicts, client_sizes):
     return global_model
 
 
+class FairnessTracker:
+    def __init__(self, client_ids, f=1, b=3, num_priority=2):
+        """
+        Args:
+            client_ids: 所有客户端ID列表
+            f: 公平性递增步长
+            b: 强制选择阈值
+            num_priority: 需要强制选择的最大客户端数量
+        """
+        self.f = f
+        self.b = b
+        self.num_priority = num_priority
+        self.fairness_metrics = {client_id: 1 for client_id in client_ids}
+
+    def update(self, selected_clients):
+        """更新公平性指标"""
+        for client_id in self.fairness_metrics:
+            if client_id in selected_clients:
+                self.fairness_metrics[client_id] = 1  # 被选中则重置为1
+            else:
+                self.fairness_metrics[client_id] += self.f  # 未被选中则增加f
+
+    def get_priority_clients(self):
+        """获取需要强制选择的客户端(Fi >= b)，选择Fi最大的num_priority个"""
+        priority_candidates = [
+            (client_id, fi)
+            for client_id, fi in self.fairness_metrics.items()
+        ]
+        for client_id, fi in self.fairness_metrics.items():
+            if fi >= self.b:
+                priority_candidates.sort(key=lambda x: x[1], reverse=True)
+                return [client_id for client_id, _ in priority_candidates[:self.num_priority]]
+        return []
+
+    def get_metrics(self):
+        """获取当前所有客户端的公平性指标"""
+        return self.fairness_metrics.copy()
+
 # 评估模型
 def evaluate(model, test_loader):
     model.eval()
@@ -217,64 +270,46 @@ def evaluate(model, test_loader):
     accuracy = correct / total * 100
     return total_loss / len(test_loader), accuracy
 
+def entropy_weight(matrix):
 
-def entropy_weight(l):
-    weight = []
-    for X in l:
+    matrix = matrix / matrix.mean(axis=0)
+    P = matrix / matrix.sum(axis=0)
+    K = 1 / np.log(matrix.shape[0])
+    E = -K * np.sum(P * np.log(P + 1e-12), axis=0)
+    d = 1 - E
+    w = d / np.sum(d)
+    return w
 
-        P = X / X.sum(axis=0)
+def calculate_GRC(client_losses,param_diffs):
 
-        K = 1 / np.log(len(X))
-        E = -K * (P * np.log(P + 1e-12)).sum(axis=0)
-        weight.append(E)
-    one_minus_weight = [1 - w for w in weight]
-    sum_one_minus_weight = sum(one_minus_weight)
-    new_weight = [w / sum_one_minus_weight for w in one_minus_weight]
-
-    return new_weight
-
-
-def calculate_GRC(global_model, client_models, client_losses):
-    """
-    计算客户端的 GRC 分数。
-
-    参数:
-        global_model (nn.Module): 全局模型。
-        client_models (list): 客户端本地模型列表。
-        client_losses (list): 客户端训练损失列表。
-
-    返回:
-        list: 每个客户端的 GRC 分数。
-    """
-    # 1. 构建参考序列（理想值：损失=0，模型参数差异=0）
-    ref_loss = 0.0
-    ref_param_diff = 0.0
-
-    # 2. 计算客户端指标
-    param_diffs = []
-    for model in client_models:
-        diff = 0.0
-        for g_param, l_param in zip(global_model.parameters(), model.parameters()):
-            diff += torch.norm(g_param - l_param).item()  # 参数差异（L2范数）
-        param_diffs.append(diff)
-
-    # 3. 对 losses 和 diffs 进行 mapping
-    def map_sequence(sequence):
+    # 3.  mapping
+    def map_sequence_loss(sequence):
         max_val = max(sequence)
         min_val = min(sequence)
-        return [(max_val + x) / (max_val + min_val) for x in sequence]
+        return [(max_val - x) / (max_val - min_val) for x in sequence]
 
-    client_losses = map_sequence(client_losses)  # 映射后的 losses
-    param_diffs = map_sequence(param_diffs)  # 映射后的 diffs
+    def map_sequence_diff(sequence):
+        max_val = max(sequence)
+        min_val = min(sequence)
+        return [(x - min_val) / (max_val - min_val) for x in sequence]
+
+    client_losses = map_sequence_loss(client_losses)
+    param_diffs = map_sequence_diff(param_diffs)
+
+    new_client_losses = [x / sum(client_losses) for x in client_losses]
+    new_param_diffs = [x / sum(param_diffs) for x in param_diffs]
+    # new_client_losses = client_losses
+    # new_param_diffs = param_diffs
 
 
-    max_loss = max(client_losses)
-    max_diff = max(param_diffs)
 
-
+    max_loss = max(new_client_losses)
+    min_loss = min(new_client_losses)
+    max_diff = max(new_param_diffs)
+    min_diff = min(new_param_diffs)
     # 4. 计算全局极值
     all_deltas = []
-    for nl, nd in zip(client_losses, param_diffs):
+    for nl, nd in zip(new_client_losses, new_param_diffs):
         all_deltas.append(abs(nl - max_loss))  # 损失差值
         all_deltas.append(abs(nd - max_diff))  # 参数差异差值
     max_delta = max(all_deltas)  # 全局最大值
@@ -284,58 +319,75 @@ def calculate_GRC(global_model, client_models, client_losses):
     grc_scores = []
     grc_losses = []
     grc_diffs = []
-    for nl, nd in zip(client_losses, param_diffs):
+    for nl, nd in zip(new_client_losses, new_param_diffs):
         delta_loss = abs(nl - max_loss)
         delta_diff = abs(nd - max_diff)
 
         # 灰色关联系数公式
-        grc_loss = (min_delta + 0.5 * max_delta) / (delta_loss + 0.5 * max_delta)
-        grc_diff = (min_delta + 0.5 * max_delta) / (delta_diff + 0.5 * max_delta)
+        rho = 0.5
+        grc_loss = (min_loss + rho * max_loss) / (delta_loss + rho * max_loss)
+        grc_diff = (min_diff + rho * max_diff) / (delta_diff + rho * max_diff)
 
         grc_losses.append(grc_loss)
         grc_diffs.append(grc_diff)
 
     # 将 grc_loss 和 grc_diff 组合成指标矩阵 (n_clients × 2)
-    grc_metrics = np.array([client_losses, param_diffs])
+    grc_metrics = np.stack([client_losses, param_diffs], axis=1)
 
     # 计算熵权法权重
-    weights = entropy_weight(grc_metrics)  # 形如 [w_loss, w_diff]
+    weights = entropy_weight(grc_metrics)  # [w_loss, w_diff]
+    print(weights)
 
 
+    # 计算最终的加权分数
+    weighted_score = [
+        loss * weights[0] + diff * weights[1]
+        for loss, diff in zip(grc_losses, grc_diffs)
+    ]
 
-    weighted_score = grc_losses / weights[0] + grc_diffs / weights[1]
-
-
-    return weighted_score
+    return weighted_score,weights
 
 
 def select_clients(client_loaders, use_all_clients=False, num_select=None,
-                   select_by_loss=False, global_model=None, grc=False):
+                   select_by_loss=False, global_model=None, grc=False,
+                   fairness_tracker=None):
+    def weight_divergence(global_model, client_model):
+        d_i = 0.0
+        for g_param, c_param in zip(global_model.parameters(), client_model.parameters()):
+            d_i += torch.norm(g_param - c_param, p=2).item()
+        return d_i
+
+    if fairness_tracker:
+        priority_clients = fairness_tracker.get_priority_clients()
+        if priority_clients:
+            print(f"⚠️ 公平性强制选择客户端(Fi最大的{len(priority_clients)}个): {priority_clients}")
+            return priority_clients
+
+    # 2. 原有的GRC选择逻辑
     if grc:
         client_models = []
-
-
         client_losses = []
+        param_diffs = []
         for client_id, client_loader in client_loaders.items():
             local_model = MLPModel()
             local_model.load_state_dict(global_model.state_dict())
             local_state = local_train(local_model, client_loader, epochs=1, lr=0.01)
-            client_models.append(local_model)
-            loss, _ = evaluate(global_model, client_loader)
+            local_model.load_state_dict(local_state)
+            loss, _ = evaluate(local_model, client_loader)
             client_losses.append(loss)
+            param_diffs.append(weight_divergence(global_model, local_model))
 
-
-        grc_scores = calculate_GRC(global_model, client_models, client_losses)
-
+        grc_scores, grc_weights = calculate_GRC(client_losses, param_diffs)
+        select_clients.latest_weights = grc_weights
 
         client_grc_pairs = list(zip(client_loaders.keys(), grc_scores))
         client_grc_pairs.sort(key=lambda x: x[1], reverse=True)
 
-
+        # 确保至少选择num_select个客户端
         selected = [client_id for client_id, _ in client_grc_pairs[:num_select]]
         return selected
 
-    # 其余选择逻辑保持不变
+
     if use_all_clients is True:
         print("Selecting all clients")
         return list(client_loaders.keys())
@@ -413,13 +465,20 @@ def main():
     csv_filename = f"training_data_{timestamp}.csv"
     csv_data = []
 
+    fairness_tracker = FairnessTracker(client_loaders.keys(), f=1, b=10, num_priority = 2)
+
     for r in range(rounds):
         print(f"\n🔄 第 {r + 1} 轮聚合")
         # 选择客户端
-        if r % 3 == 0:
+        # _ = selected_clients = select_clients(client_loaders, use_all_clients=use_all_clients,
+        #                                       num_select=num_selected_clients,
+        #                                       select_by_loss=use_loss_based_selection, global_model=global_model, grc=grc, fairness_tracker=None)
+        if r % 2 == 0:
             selected_clients = select_clients(client_loaders, use_all_clients=use_all_clients,
-                                          num_select=num_selected_clients,
-                                          select_by_loss=use_loss_based_selection, global_model=global_model, grc=grc)
+                                              num_select=num_selected_clients,
+                                              select_by_loss=use_loss_based_selection, global_model=global_model, grc=grc, fairness_tracker=fairness_tracker)
+            fairness_tracker.update(selected_clients)
+            print("公平性指标:", fairness_tracker.get_metrics())
 
         # # 设置随机阻断某个客户端的接收记录（验证用）
         # blocked_client = random.choice(selected_clients)
@@ -449,12 +508,14 @@ def main():
             print(f"  📌 客户端 {client_id} 模型参数均值: {param_mean}")
 
         # 计算本轮通信次数
-        total_send = sum(
-            communication_counts[c]['send'] - (communication_counts[c]['full_round'] - 1) for c in selected_clients)
-        total_receive = sum(
-            communication_counts[c]['receive'] - (communication_counts[c]['full_round'] - 1) for c in selected_clients)
+        total_send = sum(communication_counts[c]['send'] - (communication_counts[c]['full_round'] - 1) for c in selected_clients)
+        total_receive = sum(communication_counts[c]['receive'] - (communication_counts[c]['full_round'] - 1) for c in selected_clients)
         total_comm = total_send + total_receive  # 每轮独立的总通信次数
-        total_communication_counts.append(total_comm)  # 记录当前轮的通信次数
+
+        # 如果不是第一轮，累加前一轮的通信次数
+        if len(total_communication_counts) > 0:
+            total_comm += total_communication_counts[-1]
+        total_communication_counts.append(total_comm)
 
         # 聚合模型参数
         global_model = fed_avg(global_model, client_state_dicts, client_data_sizes)
@@ -469,17 +530,27 @@ def main():
         print(f"📊 测试集损失: {loss:.4f} | 测试集准确率: {accuracy:.2f}%")
 
         # 记录数据到 CSV
+        if grc and hasattr(select_clients, 'latest_weights'):
+            w_loss = select_clients.latest_weights[0]
+            w_diff = select_clients.latest_weights[1]
+        else:
+            w_loss = 'NA'
+            w_diff = 'NA'
+
         csv_data.append([
             r + 1,
             accuracy,
             total_comm,
-            ",".join(map(str, selected_clients))
+            ",".join(map(str, selected_clients)),
+            w_loss,
+            w_diff
         ])
 
     # 保存数据到 CSV 文件
     df = pd.DataFrame(csv_data, columns=[
-        'Round', 'Accuracy', 'Total communication counts', 'Selected Clients'
-    ])
+    'Round', 'Accuracy', 'Total communication counts', 'Selected Clients',
+    'GRC Weight - Loss', 'GRC Weight - Diff' ])
+
     df.to_csv(csv_filename, index=False)
     print(f"训练数据已保存至 {csv_filename}")
 
