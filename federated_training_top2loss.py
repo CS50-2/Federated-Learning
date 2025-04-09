@@ -60,17 +60,30 @@ def load_mnist_data(data_path="./data"):
 def split_data_by_label(dataset, num_clients=10):
     
     # Mannually set each client'id and corresponding dataset distribution 
+    # client_data_sizes = {
+    #     0: {0: 600, 1: 700, 2: 600, 3: 600, 4: 500, 5: 500, 6: 100, 7: 100, 8: 100, 9: 100},
+    #     1: {0: 700, 1: 600, 2: 600, 3: 600, 4: 500, 5: 100, 6: 100, 7: 100, 8: 100, 9: 600},
+    #     2: {0: 500, 1: 600, 2: 700, 3: 600, 4: 100, 5: 100, 6: 100, 7: 100, 8: 600, 9: 500},
+    #     3: {0: 600, 1: 600, 2: 500, 3: 100, 4: 100, 5: 100, 6: 100, 7: 500, 8: 500, 9: 700},
+    #     4: {0: 600, 1: 500, 2: 100, 3: 100, 4: 100, 5: 100, 6: 600, 7: 700, 8: 500, 9: 500},
+    #     5: {0: 500, 1: 100, 2: 100, 3: 100, 4: 100, 5: 600, 6: 500, 7: 600, 8: 700, 9: 600},
+    #     6: {0: 100, 1: 100, 2: 100, 3: 100, 4: 700, 5: 500, 6: 600, 7: 500, 8: 500, 9: 600},
+    #     7: {0: 100, 1: 100, 2: 100, 3: 600, 4: 500, 5: 600, 6: 500, 7: 600, 8: 500, 9: 100},
+    #     8: {0: 100, 1: 100, 2: 500, 3: 500, 4: 600, 5: 500, 6: 600, 7: 500, 8: 100, 9: 100},
+    #     9: {0: 100, 1: 700, 2: 600, 3: 600, 4: 600, 5: 500, 6: 600, 7: 100, 8: 100, 9: 100}
+    # }
+
     client_data_sizes = {
-        0: {0: 600, 1: 700, 2: 600, 3: 600, 4: 500, 5: 500, 6: 100, 7: 100, 8: 100, 9: 100},
-        1: {0: 700, 1: 600, 2: 600, 3: 600, 4: 500, 5: 100, 6: 100, 7: 100, 8: 100, 9: 600},
-        2: {0: 500, 1: 600, 2: 700, 3: 600, 4: 100, 5: 100, 6: 100, 7: 100, 8: 600, 9: 500},
-        3: {0: 600, 1: 600, 2: 500, 3: 100, 4: 100, 5: 100, 6: 100, 7: 500, 8: 500, 9: 700},
-        4: {0: 600, 1: 500, 2: 100, 3: 100, 4: 100, 5: 100, 6: 600, 7: 700, 8: 500, 9: 500},
-        5: {0: 500, 1: 100, 2: 100, 3: 100, 4: 100, 5: 600, 6: 500, 7: 600, 8: 700, 9: 600},
-        6: {0: 100, 1: 100, 2: 100, 3: 100, 4: 700, 5: 500, 6: 600, 7: 500, 8: 500, 9: 600},
-        7: {0: 100, 1: 100, 2: 100, 3: 600, 4: 500, 5: 600, 6: 500, 7: 600, 8: 500, 9: 100},
-        8: {0: 100, 1: 100, 2: 500, 3: 500, 4: 600, 5: 500, 6: 600, 7: 500, 8: 100, 9: 100},
-        9: {0: 100, 1: 700, 2: 600, 3: 600, 4: 600, 5: 500, 6: 600, 7: 100, 8: 100, 9: 100}
+        0: {0: 600},
+        1: {1: 600},
+        2: {2: 500},
+        3: {3: 600},
+        4: {4: 600},
+        5: {5: 500},
+        6: {6: 100},
+        7: {7: 100},
+        8: {8: 100},
+        9: {9: 100}
     }
 
     # Initialize an empty dictionary to store indices for each label (from 0 to 9) 
@@ -269,7 +282,7 @@ def calculate_GRC(global_model, client_models, client_losses):
     weights = entropy_weight(grc_metrics)  # Expected output: [w_loss, w_diff]
 
     # Compute the final weighted GRC score for each client by combining the GRC values for loss and parameter differences
-    weighted_score = grc_losses / weights[0] + grc_diffs / weights[1]
+    weighted_score = grc_losses * weights[0] + grc_diffs * weights[1]
 
     return weighted_score
 
@@ -377,8 +390,8 @@ def run_experiment(selection_method, rounds=100, num_selected_clients=2):
                                               select_by_loss=True, global_model=global_model, grc=False)
         elif selection_method == "fedavg":
             # Use FedAvg with either random selection or all clients.
-            # Here we assume using all clients or random selection for FedAvg.
-            selected_clients = list(client_loaders.keys())  # Or random.sample(...)
+            # Using all clients or random selection for FedAvg.
+            selected_clients = list(client_loaders.keys())  
 
         # Record receive communication count
         update_communication_counts(communication_counts, selected_clients, "receive")
@@ -418,19 +431,18 @@ def run_experiment(selection_method, rounds=100, num_selected_clients=2):
     return df
 
 def main_experiments():
-    # Assume client_loaders, client_data_sizes, test_loader, etc., are already defined.
     
-    rounds = 200
+    rounds = 10
     # Run experiments for each method
     df_fedGRA = run_experiment("fedGRA", rounds, num_selected_clients=2)
     df_high_loss = run_experiment("high_loss", rounds, num_selected_clients=2)
-    df_fedavg = run_experiment("fedavg", rounds, num_selected_clients=2)
+    df_fedavg = run_experiment("fedavg", rounds, num_selected_clients=10)
     
     # Merge DataFrames on 'Round'
     df_combined = df_fedGRA.merge(df_high_loss, on='Round').merge(df_fedavg, on='Round')
     
     # Save to CSV for later inspection if needed
-    df_combined.to_csv("comparison_results.csv", index=False)
+    df_combined.to_csv("comparison_results_test.csv", index=False)
 
 if __name__ == "__main__":
     main_experiments()
