@@ -334,19 +334,19 @@ def update_dropdown_options(data_json):
     State("comp-range-upper", "value")
 )
 def update_comparison_chart(n_clicks, groupby_col, col1, col2, data_json, comp_lower, comp_upper):
-    # Validate input
+    # Validate input: if button hasn't been clicked or required inputs are missing, return a message figure.
     if n_clicks is None or n_clicks == 0 or not all([groupby_col, col1, col2, data_json]):
         return go.Figure().update_layout(title="Please select Group by and both numeric columns to compare.")
     
     df = pd.read_json(data_json, orient='split')
     
-    # Group by and aggregate only the necessary columns
+    # Group by the selected column and aggregate only the selected numeric columns
     try:
         grouped_df = df.groupby(groupby_col)[[col1, col2]].mean().reset_index()
     except Exception as e:
         return go.Figure().update_layout(title=f"Error during grouping: {e}")
     
-    # Optional: if numeric filtering on groupby column is needed
+    # If a numeric range is provided, attempt to convert the groupby column to numeric and filter groups
     if comp_lower is not None and comp_upper is not None:
         try:
             grouped_df[groupby_col] = pd.to_numeric(grouped_df[groupby_col], errors='coerce')
@@ -354,42 +354,55 @@ def update_comparison_chart(n_clicks, groupby_col, col1, col2, data_json, comp_l
         except Exception as e:
             pass
 
-    # Sort the grouped data to ensure the x-axis order is consistent across traces
+    # Sort the grouped data to ensure a consistent x-axis order
     grouped_df = grouped_df.sort_values(by=groupby_col)
 
-    # Calculate the overall median for the two selected columns
-    overall_median = pd.concat([grouped_df[col1], grouped_df[col2]]).median()
-
-    # Create two bar traces based on the same grouped data and sorted group keys
     trace1 = go.Bar(
         x=grouped_df[groupby_col],
-        y=grouped_df[col1] - overall_median,
-        base=overall_median,
+        y=grouped_df[col1],
+        base=0,  
         name=col1
     )
     trace2 = go.Bar(
         x=grouped_df[groupby_col],
-        y=grouped_df[col2] - overall_median,
-        base=overall_median,
+        y=-grouped_df[col2], 
+        base=0,
         name=col2
     )
     
+    # Build the figure and add a horizontal reference line at 0
     fig = go.Figure(data=[trace1, trace2])
     fig.add_shape(
         type="line",
         x0=min(grouped_df[groupby_col]),
         x1=max(grouped_df[groupby_col]),
-        y0=overall_median,
-        y1=overall_median,
+        y0=0,   # Reference line at 0
+        y1=0,
         line=dict(color="Black", width=2, dash="dash")
     )
+
+    max_val1 = grouped_df[col1].max()
+    max_val2 = grouped_df[col2].max()
+    max_val = max(max_val1, max_val2)
+    
+    tick_vals = [-max_val, -max_val/2, 0, max_val/2, max_val]
+    tick_text = [str(round(abs(x), 2)) for x in tick_vals]
+    
+    fig.update_yaxes(
+        tickmode='array',
+        tickvals=tick_vals,
+        ticktext=tick_text
+    )
+
     fig.update_layout(
         title=f"Comparison of {col1} and {col2} grouped by {groupby_col}",
         xaxis_title=groupby_col,
         yaxis_title="Value",
-        barmode='group'
+        barmode='overlay'  # Overlay mode, display up and down
     )
     return fig
+
+
 
 
 if __name__ == '__main__':
