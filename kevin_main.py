@@ -498,7 +498,7 @@ def main():
             client_loader = client_loaders[client_id]
             local_model = MLPModel()
             local_model.load_state_dict(global_model.state_dict())  # 复制全局模型参数
-            local_state = local_train(local_model, client_loader, epochs=1, lr=0.01)  # 训练 1 轮
+            local_state = local_train(local_model, client_loader, epochs=5, lr=0.01)  # 训练 1 轮
             client_state_dicts.append((client_id, local_state))  # 存储 (客户端ID, 训练后的参数)
 
             update_communication_counts(communication_counts, [client_id], "send")  # 记录客户端上报通信次数

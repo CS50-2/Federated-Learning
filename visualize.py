@@ -6,10 +6,13 @@ import pandas as pd
 import plotly.graph_objs as go
 import plotly.express as px
 
+# Initialising app 
 app = dash.Dash(__name__)
+
 
 app.layout = html.Div([
     html.H1("CSV File Upload and Dynamic Multi-Line Chart"),
+    # csv upload interface
     dcc.Upload(
         id='upload-data',
         children=html.Div(['Drag and drop or click to select a CSV file']),
@@ -25,18 +28,18 @@ app.layout = html.Div([
         },
         accept='.csv'
     ),
-    # Store for the parsed DataFrame JSON and current number of line selectors
+    # Store for the uploaded data and the current count of dynamic line selectors
     dcc.Store(id='stored-data'),
-    dcc.Store(id='line-count', data=1),  # Initially, only one line selector is available
+    dcc.Store(id='line-count', data=1),  # Initially, only one dynamic line selector
 
-    # Container for displaying the upload contents (data preview, dynamic options, charts, and x-range selection)
+    # Main page content container
     html.Div(id='upload-content')
 ])
 
-
+# Parse the uploaded file contents into a Pandas DataFrame.
 def parse_contents(contents, filename):
-    """Parse the uploaded file contents into a Pandas DataFrame."""
-    content_type, content_string = contents.split(',')
+
+    _, content_string = contents.split(',') # base64,<encoded_content>
     decoded = base64.b64decode(content_string)
     try:
         if 'csv' in filename.lower():
@@ -47,8 +50,7 @@ def parse_contents(contents, filename):
         return None, html.Div(['There was an error processing the file: ' + str(e)])
     return df, None
 
-
-# Callback: Process file upload, display data preview, dynamic line options, custom chart, and x-axis range selection
+# Callback: Process file upload, display data preview, dynamic line options, charts, x-axis range filter, and comparison chart inputs.
 @app.callback(
     [Output('upload-content', 'children'),
      Output('stored-data', 'data')],
@@ -63,7 +65,7 @@ def update_upload(contents, filename):
     if error is not None:
         return error, None
 
-    # Data preview table (first 5 rows)
+    # Data preview table: show first 5 rows
     preview_table = dash_table.DataTable(
         id='data-preview',
         columns=[{"name": col, "id": col} for col in df.columns],
@@ -72,16 +74,14 @@ def update_upload(contents, filename):
         style_cell={'textAlign': 'left'}
     )
 
-    # Dynamic line options block
+    # Dynamic line chart options block
     selectors_block = html.Div([
         html.H2("Line Chart Options"),
-        # "Add Line" button
         html.Button("Add Line", id="add-line-btn", n_clicks=0),
-        # Container to hold dynamic line selectors
         html.Div(id="line-selectors-container")
     ])
 
-    # x-axis range selector for detailed view
+    # x-axis range selection block (detailed view)
     if "Round" in df.columns:
         x_col = "Round"
     elif pd.api.types.is_numeric_dtype(df[df.columns[0]]):
@@ -104,15 +104,41 @@ def update_upload(contents, filename):
                     dcc.Input(id="x-range-upper", type="number", value=x_upper_default)
                 ], style={'display': 'inline-block'})
             ]),
-            # New update button for the filtered chart
             html.Button("Update Filtered Chart", id="update-filtered-chart-btn", n_clicks=0, style={'margin-top': '10px'}),
             dcc.Graph(id="filtered-chart", style={'margin-top': '20px'})
         ])
     else:
-        # If no valid numeric column is available for x-axis, do not display the range selector.
         range_block = html.Div(["The uploaded data does not contain a numeric column to use as x-axis filtering."])
 
-    # Combine all content together
+    # Comparison chart section with range selection inputs
+    comparison_block = html.Div([
+        html.H2("Comparison Chart: Diverging Bar Plot"),
+        html.Div([
+            html.Label("Group by Column:"),
+            dcc.Dropdown(id="groupby-column", options=[], placeholder="Select grouping column")
+        ], style={'width': '30%', 'display': 'inline-block', 'margin-right': '20px'}),
+        html.Div([
+            html.Label("Barplot Column 1:"),
+            dcc.Dropdown(id="barplot-col1", options=[], placeholder="Select first numeric column")
+        ], style={'width': '30%', 'display': 'inline-block', 'margin-right': '20px'}),
+        html.Div([
+            html.Label("Barplot Column 2:"),
+            dcc.Dropdown(id="barplot-col2", options=[], placeholder="Select second numeric column")
+        ], style={'width': '30%', 'display': 'inline-block'}),
+        html.Br(),
+        # New range selection for the comparison chart (applied on the groupby column if numeric)
+        html.Div([
+            html.Label("Select Group Range:"),
+            html.Div([
+                dcc.Input(id="comp-range-lower", type="number", placeholder="Lower bound"),
+                dcc.Input(id="comp-range-upper", type="number", placeholder="Upper bound")
+            ], style={'display': 'inline-block', 'margin-right': '20px'})
+        ], style={'margin-top': '10px'}),
+        html.Button("Update Comparison Chart", id="update-comp-chart-btn", n_clicks=0, style={'margin-top': '10px'}),
+        dcc.Graph(id="comparison-chart", style={'margin-top': '20px'})
+    ], style={'margin-top': '40px'})
+
+    # Combine all components into the main content layout
     content = html.Div([
         html.H2("Data Preview (First 5 Rows)"),
         preview_table,
@@ -120,15 +146,16 @@ def update_upload(contents, filename):
         dcc.Graph(id="custom-chart"),
         html.Div(id="click-output", style={'margin-top': '20px', 'font-size': '20px'}),
         html.Hr(),
-        range_block
+        range_block,
+        html.Hr(),
+        comparison_block
     ])
 
-    # Store the DataFrame as JSON using 'split' orientation
+    # Store the DataFrame as JSON using the 'split' orientation
     data_json = df.to_json(date_format='iso', orient='split')
     return content, data_json
 
-
-# Callback: Increase the number of line selectors when the "Add Line" button is clicked (max 5)
+# Callback: Increase the number of dynamic line selectors when "Add Line" is clicked (max 5)
 @app.callback(
     Output('line-count', 'data'),
     Input('add-line-btn', 'n_clicks'),
@@ -137,12 +164,10 @@ def update_upload(contents, filename):
 def update_line_count(n_clicks, current_count):
     if n_clicks is None:
         raise dash.exceptions.PreventUpdate
-    # Increase the count by one per click, but limit it to 5
     new_count = min(current_count + n_clicks, 5)
     return new_count
 
-
-# Callback: Dynamically generate line selector panels based on the line count and stored data
+# Callback: Update dynamic line selectors based on current count and stored data.
 @app.callback(
     Output('line-selectors-container', 'children'),
     [Input('line-count', 'data'),
@@ -157,9 +182,8 @@ def update_line_selectors(line_count, data_json):
     dropdown_options = [{"label": col, "value": col} for col in columns]
 
     selectors = []
-    # Create one panel per line selector
     for i in range(line_count):
-        default_enable = ['show'] if i == 0 else []  # Only the first is enabled by default
+        default_enable = ['show'] if i == 0 else []
         default_x = columns[0] if len(columns) > 0 else None
         default_y = columns[1] if len(columns) > 1 else None
 
@@ -190,8 +214,7 @@ def update_line_selectors(line_count, data_json):
         )
     return selectors
 
-
-# Callback: Update the custom chart using all dynamic line selector values
+# Callback: Update the custom multi-line chart based on dynamic selector inputs.
 @app.callback(
     Output("custom-chart", "figure"),
     [Input({'type': 'line-enable', 'index': ALL}, 'value'),
@@ -205,7 +228,7 @@ def update_chart(line_enables, line_xs, line_ys, data_json):
     df = pd.read_json(data_json, orient='split')
     fig = go.Figure()
 
-    # Add a trace for each enabled line if both x and y selections are made
+    # Add a trace for each enabled line based on the selected x and y columns
     for i, (enable, x_col, y_col) in enumerate(zip(line_enables, line_xs, line_ys)):
         if (enable is not None and 'show' in enable) and x_col and y_col:
             fig.add_trace(go.Scatter(
@@ -219,8 +242,7 @@ def update_chart(line_enables, line_xs, line_ys, data_json):
                       yaxis_title="Y-axis")
     return fig
 
-
-# Callback: Display details when a point in the custom chart is clicked
+# Callback: When clicking on a point in the custom chart, show detailed information.
 @app.callback(
     Output("click-output", "children"),
     [Input("custom-chart", "clickData"),
@@ -237,12 +259,9 @@ def display_click_data(clickData, data_json):
     x_value = point["x"]
     y_value = point["y"]
     trace_index = point["curveNumber"]
-    
     return f"Clicked point: x = {x_value}, y = {y_value}, Trace index = {trace_index}"
 
-
-# Callback: Update the filtered chart based on the x-axis range selection and all active dynamic line selections
-# This callback is triggered by the "Update Filtered Chart" button.
+# Callback: Update the filtered chart based on selected x-axis range and dynamic line selections.
 @app.callback(
     Output("filtered-chart", "figure"),
     Input("update-filtered-chart-btn", "n_clicks"),
@@ -254,18 +273,15 @@ def display_click_data(clickData, data_json):
     State({'type': 'line-y', 'index': ALL}, 'value')
 )
 def update_filtered_chart(n_clicks, x_lower, x_upper, data_json, line_enables, line_xs, line_ys):
-    # If required inputs are missing, return empty figure.
     if n_clicks is None or data_json is None or x_lower is None or x_upper is None:
         return {}
     
     df = pd.read_json(data_json, orient='split')
     fig = go.Figure()
     
-    # Loop over all dynamic line selectors; add a trace for each active (enabled) pair.
     any_line_added = False
     for enable, x_col, y_col in zip(line_enables, line_xs, line_ys):
         if enable is not None and 'show' in enable and x_col and y_col:
-            # Filter the data for the corresponding x column using the selected range.
             filtered_df = df[(df[x_col] >= x_lower) & (df[x_col] <= x_upper)]
             if not filtered_df.empty:
                 fig.add_trace(go.Scatter(
@@ -276,7 +292,6 @@ def update_filtered_chart(n_clicks, x_lower, x_upper, data_json, line_enables, l
                 ))
                 any_line_added = True
     
-    # If no traces were added, update the layout with an informational title.
     if not any_line_added:
         fig.update_layout(title="No data available for the selected range.",
                           xaxis_title="X-axis",
@@ -288,6 +303,93 @@ def update_filtered_chart(n_clicks, x_lower, x_upper, data_json, line_enables, l
     
     return fig
 
+# Callback: When the uploaded data changes, update the dropdown options for the comparison chart.
+@app.callback(
+    [Output("groupby-column", "options"),
+     Output("barplot-col1", "options"),
+     Output("barplot-col2", "options")],
+    Input("stored-data", "data")
+)
+def update_dropdown_options(data_json):
+    if data_json is None:
+        return [], [], []
+    df = pd.read_json(data_json, orient='split')
+    # Allow all columns for grouping
+    groupby_options = [{"label": col, "value": col} for col in df.columns]
+    # Only allow numeric columns for barplot selections
+    numeric_cols = [col for col in df.columns if pd.api.types.is_numeric_dtype(df[col])]
+    numeric_options = [{"label": col, "value": col} for col in numeric_cols]
+    return groupby_options, numeric_options, numeric_options
+
+# Callback: Update the diverging bar plot (comparison chart) after the user clicks the button.
+# A range filter on the groupby column is also applied if provided.
+@app.callback(
+    Output("comparison-chart", "figure"),
+    Input("update-comp-chart-btn", "n_clicks"),
+    State("groupby-column", "value"),
+    State("barplot-col1", "value"),
+    State("barplot-col2", "value"),
+    State("stored-data", "data"),
+    State("comp-range-lower", "value"),
+    State("comp-range-upper", "value")
+)
+def update_comparison_chart(n_clicks, groupby_col, col1, col2, data_json, comp_lower, comp_upper):
+    # Validate input
+    if n_clicks is None or n_clicks == 0 or not all([groupby_col, col1, col2, data_json]):
+        return go.Figure().update_layout(title="Please select Group by and both numeric columns to compare.")
+    
+    df = pd.read_json(data_json, orient='split')
+    
+    # Group by and aggregate only the necessary columns
+    try:
+        grouped_df = df.groupby(groupby_col)[[col1, col2]].mean().reset_index()
+    except Exception as e:
+        return go.Figure().update_layout(title=f"Error during grouping: {e}")
+    
+    # Optional: if numeric filtering on groupby column is needed
+    if comp_lower is not None and comp_upper is not None:
+        try:
+            grouped_df[groupby_col] = pd.to_numeric(grouped_df[groupby_col], errors='coerce')
+            grouped_df = grouped_df[(grouped_df[groupby_col] >= comp_lower) & (grouped_df[groupby_col] <= comp_upper)]
+        except Exception as e:
+            pass
+
+    # Sort the grouped data to ensure the x-axis order is consistent across traces
+    grouped_df = grouped_df.sort_values(by=groupby_col)
+
+    # Calculate the overall median for the two selected columns
+    overall_median = pd.concat([grouped_df[col1], grouped_df[col2]]).median()
+
+    # Create two bar traces based on the same grouped data and sorted group keys
+    trace1 = go.Bar(
+        x=grouped_df[groupby_col],
+        y=grouped_df[col1] - overall_median,
+        base=overall_median,
+        name=col1
+    )
+    trace2 = go.Bar(
+        x=grouped_df[groupby_col],
+        y=grouped_df[col2] - overall_median,
+        base=overall_median,
+        name=col2
+    )
+    
+    fig = go.Figure(data=[trace1, trace2])
+    fig.add_shape(
+        type="line",
+        x0=min(grouped_df[groupby_col]),
+        x1=max(grouped_df[groupby_col]),
+        y0=overall_median,
+        y1=overall_median,
+        line=dict(color="Black", width=2, dash="dash")
+    )
+    fig.update_layout(
+        title=f"Comparison of {col1} and {col2} grouped by {groupby_col}",
+        xaxis_title=groupby_col,
+        yaxis_title="Value",
+        barmode='group'
+    )
+    return fig
 
 
 if __name__ == '__main__':
