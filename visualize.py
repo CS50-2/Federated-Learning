@@ -403,7 +403,5 @@ def update_comparison_chart(n_clicks, groupby_col, col1, col2, data_json, comp_l
     return fig
 
 
-
-
 if __name__ == '__main__':
     app.run_server(debug=True)

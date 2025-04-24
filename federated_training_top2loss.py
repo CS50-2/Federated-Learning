@@ -216,99 +216,92 @@ def entropy_weight(l):
 
 def calculate_GRC(global_model, client_models, client_losses):
     """
-    Calculate the Grey Relational Coefficient (GRC) scores for each client.
-    
-    Parameters:
-        global_model (nn.Module): The global model.
-        client_models (list): A list of client local models.
-        client_losses (list): A list of training losses for each client.
-    
-    Returns:
-        list: The GRC score for each client.
+    正确计算 GRC 分数，并修正后续步骤
     """
-    # Construct reference sequences (ideal values: loss=0, parameter difference=0)
-    ref_loss = 0.0
-    ref_param_diff = 0.0
 
-    # Compute client metrics: calculate the L2 norm difference between the global model and each client model (parameter differences)
+    # 1. 计算客户端指标（参数差异）
     param_diffs = []
     for model in client_models:
         diff = 0.0
         for g_param, l_param in zip(global_model.parameters(), model.parameters()):
-            diff += torch.norm(g_param - l_param).item()  # Compute L2 norm difference for each parameter
+            diff += torch.norm(g_param - l_param).item()
         param_diffs.append(diff)
 
-    # Normalize (map) both the client losses and parameter differences.
-    def map_sequence(sequence):
+    # 2. 对 losses 和 diffs 进行正确 mapping
+    def map_sequence_loss(sequence):
         max_val = max(sequence)
         min_val = min(sequence)
-        # Normalize each value using the formula: (max_val + x) / (max_val + min_val)
-        return [(max_val + x) / (max_val + min_val) for x in sequence]
+        return [(max_val - x) / (max_val + min_val) for x in sequence]  # 【✔】负相关
 
-    client_losses = map_sequence(client_losses)  # Normalized client losses
-    param_diffs = map_sequence(param_diffs)      # Normalized parameter differences
+    def map_sequence_diff(sequence):
+        max_val = max(sequence)
+        min_val = min(sequence)
+        return [(x - min_val) / (max_val + min_val) for x in sequence]  # 【✔】正相关
 
-    # Get the maximum values from the normalized losses and differences
-    max_loss = max(client_losses)
-    max_diff = max(param_diffs)
+    client_losses = map_sequence_loss(client_losses)
+    param_diffs = map_sequence_diff(param_diffs)
 
-    # Calculate global extreme differences across all clients and metrics
+    # 3. 构建参考序列 (理想值 = 1)
+    ref_loss = 1.0
+    ref_diff = 1.0
+
+    # 4. 计算每个指标的 Δ
     all_deltas = []
-    for nl, nd in zip(client_losses, param_diffs):
-        all_deltas.append(abs(nl - max_loss))  # Absolute deviation for loss
-        all_deltas.append(abs(nd - max_diff))  # Absolute deviation for parameter difference
-    max_delta = max(all_deltas)  # Global maximum deviation (∆max)
-    min_delta = min(all_deltas)  # Global minimum deviation (∆min)
+    for loss, diff in zip(client_losses, param_diffs):
+        all_deltas.append(abs(loss - ref_loss))
+        all_deltas.append(abs(diff - ref_diff))
+    max_delta = max(all_deltas)
+    min_delta = min(all_deltas)
 
-    # Compute the Grey Relational Coefficients (GRC) for each metric using ρ = 0.5
-    grc_losses = []  # GRC values for loss
-    grc_diffs = []   # GRC values for parameter differences
-    for nl, nd in zip(client_losses, param_diffs):
-        delta_loss = abs(nl - max_loss)
-        delta_diff = abs(nd - max_diff)
-        
-        # Apply the GRC formula:
-        # GRC = (∆min + ρ∆max) / (∆ki + ρ∆max)
+    # 5. 计算灰色关联系数 (GRC)，ρ=0.5
+    grc_losses = []
+    grc_diffs = []
+    for loss, diff in zip(client_losses, param_diffs):
+        delta_loss = abs(loss - ref_loss)
+        delta_diff = abs(diff - ref_diff)
+
         grc_loss = (min_delta + 0.5 * max_delta) / (delta_loss + 0.5 * max_delta)
         grc_diff = (min_delta + 0.5 * max_delta) / (delta_diff + 0.5 * max_delta)
-        
+
         grc_losses.append(grc_loss)
         grc_diffs.append(grc_diff)
 
-    # Combine the normalized metrics into a matrix (2 x n_clients)
-    grc_metrics = np.array([client_losses, param_diffs])
+    grc_losses = np.array(grc_losses)
+    grc_diffs = np.array(grc_diffs)
 
-    # Compute entropy weights for each metric (returns weights for loss and parameter differences)
-    weights = entropy_weight(grc_metrics)  # Expected output: [w_loss, w_diff]
+    # 6. 计算熵权（基于原始mapped数据）
+    grc_metrics = np.vstack([client_losses, param_diffs])  # 【注意】这里 shape 是 (2, n_clients)
+    weights = entropy_weight(grc_metrics)  # 【✔】熵权算的是原mapped指标，不是grc！
 
-    # Compute the final weighted GRC score for each client by combining the GRC values for loss and parameter differences
-    weighted_score = grc_losses * weights[0] + grc_diffs * weights[1]
+    # 7. 加权求和，注意是【乘法】不是除法
+    weighted_score = grc_losses * weights[0] + grc_diffs * weights[1]  # 【修改点】乘法！
 
-    return weighted_score
+    return weighted_score, weights
 
 
 def select_clients(client_loaders, use_all_clients=False, num_select=None,
-                   select_by_loss=False, global_model=None, grc=False):
-    if grc:
+                   select_by_loss=False, global_model=None, grc=True):
+    if grc:  # 使用 GRC 选择客户端
         client_models = []
-
+        # 1. 训练本地模型并计算损失
         client_losses = []
         for client_id, client_loader in client_loaders.items():
             local_model = MLPModel()
-            local_model.load_state_dict(global_model.state_dict())
-            local_state = local_train(local_model, client_loader, epochs=1, lr=0.01)
+            local_model.load_state_dict(global_model.state_dict())  # 同步全局模型
+            local_train(local_model, client_loader, epochs=1, lr=0.01)
             client_models.append(local_model)
-            loss, _ = evaluate(global_model, client_loader)
+            loss, _ = evaluate(local_model, client_loader)
             client_losses.append(loss)
 
+        # 2. 计算 GRC 分数
+        grc_scores, grc_weights = calculate_GRC(global_model, client_models, client_losses)
+        select_clients.latest_weights = grc_weights  # 记录权重
 
-        grc_scores = calculate_GRC(global_model, client_models, client_losses)
-
-
+        # 3. 按 GRC 分数排序（从高到低，GRC越高表示越好）
         client_grc_pairs = list(zip(client_loaders.keys(), grc_scores))
-        client_grc_pairs.sort(key=lambda x: x[1], reverse=True)
+        client_grc_pairs.sort(key=lambda x: x[1], reverse=True)  # 降序排序
 
-
+        # 4. 选择 GRC 最高的前 num_select 个客户端
         selected = [client_id for client_id, _ in client_grc_pairs[:num_select]]
         return selected
 
@@ -432,7 +425,7 @@ def run_experiment(selection_method, rounds=100, num_selected_clients=2):
 
 def main_experiments():
     
-    rounds = 10
+    rounds = 100
     # Run experiments for each method
     df_fedGRA = run_experiment("fedGRA", rounds, num_selected_clients=2)
     df_high_loss = run_experiment("high_loss", rounds, num_selected_clients=2)
