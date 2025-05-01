@@ -14,13 +14,46 @@ from datetime import datetime
 import torch.nn.functional as F
 import time
 
-# 定义 MLP 模型
+
+class LoRALinear(nn.Module):
+    def __init__(self, linear_layer, rank=8, alpha=8.0):
+        super().__init__()
+        self.linear = linear_layer
+        self.rank = rank
+        self.alpha = alpha / rank
+
+        m, n = self.linear.weight.shape
+        self.A = nn.Parameter(torch.randn(m, rank) * 0.01)
+        self.B = nn.Parameter(torch.zeros(n, rank))
+
+    def forward(self, x):
+        delta_W = self.alpha * (self.A @ self.B.T)
+        return self.linear(x) + F.linear(x, delta_W)
+
+    def set_requires_grad(self, lora_only=True):
+        self.linear.requires_grad_(not lora_only)
+        self.A.requires_grad_(True)
+        self.B.requires_grad_(True)
+
+
 class MLPModel(nn.Module):
-    def __init__(self, input_size=28*28, hidden_size=200, num_classes=10):
+    def __init__(self, input_size=28 * 28, hidden_size=200, num_classes=10, use_lora=False, rank=8, lora_alpha=1.0):
         super(MLPModel, self).__init__()
-        self.fc1 = nn.Linear(input_size, hidden_size)
-        self.fc2 = nn.Linear(hidden_size, hidden_size)
-        self.fc3 = nn.Linear(hidden_size, num_classes)
+        self.use_lora = use_lora
+
+        fc1 = nn.Linear(input_size, hidden_size)
+        fc2 = nn.Linear(hidden_size, hidden_size)
+        fc3 = nn.Linear(hidden_size, num_classes)
+
+        if use_lora:
+            self.fc1 = LoRALinear(fc1, rank=rank, alpha=lora_alpha)
+            self.fc2 = LoRALinear(fc2, rank=rank, alpha=lora_alpha)
+            self.fc3 = LoRALinear(fc3, rank=rank, alpha=lora_alpha)
+        else:
+            self.fc1 = fc1
+            self.fc2 = fc2
+            self.fc3 = fc3
+
         self.relu = nn.ReLU()
 
     def forward(self, x):
@@ -29,6 +62,12 @@ class MLPModel(nn.Module):
         x = self.relu(self.fc2(x))
         x = self.fc3(x)
         return x
+
+    def set_requires_grad(self, lora_only=True):
+        for module in self.children():
+            if hasattr(module, 'set_requires_grad'):
+                module.set_requires_grad(lora_only)
+
 
 # 加载 MNIST 数据集
 def load_mnist_data(data_path="./data"):
@@ -118,7 +157,6 @@ def local_train(model, train_loader, epochs=5, lr=0.01):
             loss.backward()
             optimizer.step()
     return model.state_dict()
-
 
 
 #  联邦平均聚合函数
@@ -233,19 +271,37 @@ def calculate_GRC(global_model, client_models, client_losses):
 
     return weighted_score, weights
 
-# Function to calculate FLOPs for MLP model
-def calculate_flops(model, input_size=(1, 28, 28)):
+def get_out_features(layer):
+    if isinstance(layer, LoRALinear):
+        return layer.linear.out_features
+    else:
+        return layer.out_features
+
+def calculate_flops(model, input_size):
     flops = 0
-    # Input -> FC1
-    flops += 2 * (input_size[0] * model.fc1.out_features)  # 2 * (input_size * output_size)
-    
-    # FC1 -> FC2
-    flops += 2 * (model.fc1.out_features * model.fc2.out_features)
-    
-    # FC2 -> FC3
-    flops += 2 * (model.fc2.out_features * model.fc3.out_features)
-    
+
+    # 兼容输入为 (batch_size, 784) 或 (batch_size, 1, 28, 28)
+    if len(input_size) == 2:
+        in_features = input_size[1]
+    elif len(input_size) == 3:
+        in_features = input_size[1] * input_size[2]
+    elif len(input_size) == 4:
+        in_features = input_size[1] * input_size[2] * input_size[3]
+    else:
+        raise ValueError("Unsupported input shape for FLOPs calculation")
+
+    fc1_out = get_out_features(model.fc1)
+    fc2_out = get_out_features(model.fc2)
+    fc3_out = get_out_features(model.fc3)
+
+    # FLOPs = 2 * input_dim * output_dim (multiply + add)
+    flops += 2 * in_features * fc1_out
+    flops += 2 * fc1_out * fc2_out
+    flops += 2 * fc2_out * fc3_out
+
     return flops
+
+
 
 # Function to calculate TFLOPs for one forward pass
 def calculate_tflops(model, inputs):
@@ -266,14 +322,18 @@ def calculate_tflops(model, inputs):
     return tflops
 
 def select_clients(client_loaders, use_all_clients=False, num_select=None,
-                   select_by_loss=False, global_model=None, grc=False):
+                   select_by_loss=False, global_model=None, grc=False, is_lora=False):
     if grc:  # 使用 GRC 选择客户端
         client_models = []
         # 1. 训练本地模型并计算损失
         client_losses = []
         for client_id, client_loader in client_loaders.items():
-            local_model = MLPModel()
-            local_model.load_state_dict(global_model.state_dict())  # 同步全局模型
+            # If using LoRA, update the model type
+            if is_lora:
+                local_model = MLPModel(use_lora=True) # Use LoRA model
+            else: 
+                local_model = MLPModel()  # Default to MLP model
+            local_model = load_model_weights(local_model, global_model, is_lora)  # Load weights into the model
             local_train(local_model, client_loader, epochs=1, lr=0.01)
             client_models.append(local_model)
             loss, _ = evaluate(local_model, client_loader)
@@ -289,9 +349,8 @@ def select_clients(client_loaders, use_all_clients=False, num_select=None,
 
         # 4. 选择 GRC 最高的前 num_select 个客户端
         selected = [client_id for client_id, _ in client_grc_pairs[:num_select]]
-        return selected
 
-    # 其余选择逻辑保持不变
+        return selected
 
     if use_all_clients is True:
         print("Selecting all clients")
@@ -305,7 +364,9 @@ def select_clients(client_loaders, use_all_clients=False, num_select=None,
         for client_id, loader in client_loaders.items():
             local_model = MLPModel()
             local_model.load_state_dict(global_model.state_dict())
+
             local_train(local_model, loader, epochs=1, lr=0.01)
+
             loss, _ = evaluate(local_model, loader)
             client_losses[client_id] = loss
         selected_clients = sorted(client_losses, key=client_losses.get, reverse=True)[:num_select]
@@ -315,7 +376,6 @@ def select_clients(client_loaders, use_all_clients=False, num_select=None,
         print(f"Randomly selected {num_select} clients: {selected_clients}")
 
     return selected_clients
-
 
 def update_communication_counts(communication_counts, selected_clients, event):
     """
@@ -331,181 +391,139 @@ def update_communication_counts(communication_counts, selected_clients, event):
         if event == "send" and communication_counts[client_id]['receive'] > 0:
             communication_counts[client_id]['full_round'] += 1
 
-def perform_local_training(selected_clients, client_loaders, global_model, client_data_sizes, communication_counts):
+def perform_local_training(selected_clients, client_loaders, global_model, client_data_sizes, communication_counts, is_lora=False):
     client_state_dicts = []
     round_tflops_list = []
     for client_id in selected_clients:
         client_loader = client_loaders[client_id]
-        local_model = MLPModel()
-        local_model.load_state_dict(global_model.state_dict())
-        
+
+        local_model = MLPModel(use_lora=is_lora)
+
+        # 加载全局模型权重
+        local_model = load_model_weights(local_model, global_model, is_lora)
+
         # 本地训练
         local_state = local_train(local_model, client_loader, epochs=5, lr=0.01)
         client_state_dicts.append((client_id, local_state))
         update_communication_counts(communication_counts, [client_id], "send")
- 
+
         param_mean = {name: param.mean().item() for name, param in local_model.named_parameters()}
         print(f"  ✅ 客户端 {client_id} 训练完成 | 样本数量: {sum(client_data_sizes[client_id].values())}")
         print(f"  📌 客户端 {client_id} 模型参数均值: {param_mean}")
 
-
     return client_state_dicts, round_tflops_list
 
-def run_experiment(grc, rounds, client_loaders, client_data_sizes, test_loader):
-    global_model = MLPModel()
-    results = []
-    communication_counts = {client_id: {'send': 0, 'receive': 0, 'full_round': 0} for client_id in client_loaders.keys()}
 
-    # CSV column names 
-    column_names = ["Round", "Accuracy", "TotalComm", "AvgTFlops", "SelectedClients", "ClientLosses", "ParamDiffs"]
+def load_model_weights(local_model, global_model, is_lora=False):
+    """ 
+    Load weights from the global model to the local model. 
+    If `is_lora` is True, ignore LoRA-specific parameters (A and B).
+    """
+    model_state_dict = global_model.state_dict()
+
+    # If it's the LoRA model, filter out the LoRA-specific parameters (A and B matrices)
+    if is_lora:
+        filtered_state_dict = {k: v for k, v in model_state_dict.items() if 'A' not in k and 'B' not in k}
+        local_model.load_state_dict(filtered_state_dict, strict=False)  # Load the filtered state dict
+    else:
+        local_model.load_state_dict(model_state_dict)  # For MLP model, load all parameters
+    
+    return local_model
+
+
+def run_experiment(grc, rounds, client_loaders, client_data_sizes, test_loader, is_lora=False, csv_path=None):
+    model = MLPModel(use_lora=is_lora)
+    communication_counts = {client_id: {'send': 0, 'receive': 0, 'full_round': 0} for client_id in client_loaders}
+
+    # define if it is LoRA or not 
+    prefix = "LoRA" if is_lora else "Original"
+
+    all_results = []
 
     for r in range(rounds):
-        w_loss, w_diff = 'NA', 'NA'
+        print(f"\n🔄 第 {r + 1} 轮 {'LoRA' if is_lora else 'Original'}")
 
-        print(f"\n🔄 实验 grc={grc}）第 {r + 1} 轮")
-        
-        # Select clients
-        selected_clients = select_clients(client_loaders, use_all_clients=False, num_select=2,
-                                          select_by_loss=False, global_model=global_model, grc=grc)
-        print(f"  选中客户端: {selected_clients}")
-
-        # Initialize client_losses to store losses of selected clients
-        client_losses = []
-
-        # Perform local training and collect losses
-        update_communication_counts(communication_counts, selected_clients, "receive")
-        client_state_dicts, round_tflops_list = perform_local_training(
-            selected_clients, client_loaders, global_model,
-            client_data_sizes, communication_counts
+        selected_clients = select_clients(
+            client_loaders, use_all_clients=False, num_select=2,
+            select_by_loss=False, global_model=model, grc=grc, is_lora=is_lora
         )
 
-         # Aggregate the data from selected clients
-        selected_inputs = []
-        for client_id in selected_clients:
-            # Get one batch of data from the selected client's loader
-            client_loader = client_loaders[client_id]
-            inputs, _ = next(iter(client_loader))  # Grab one batch of images
-            selected_inputs.append(inputs)
+        update_communication_counts(communication_counts, selected_clients, "receive")
 
-        # Combine inputs from both selected clients
-        combined_inputs = torch.cat(selected_inputs, dim=0)  # Concatenate the data from both clients
+        client_state_dicts, _ = perform_local_training(
+            selected_clients, client_loaders, model,
+            client_data_sizes, communication_counts, is_lora=is_lora
+        )
 
-        # Calculate TFLOPs using the combined inputs
-        tflops = calculate_tflops(global_model, combined_inputs)
+        model = fed_avg(model, client_state_dicts, client_data_sizes)
+        loss, acc = evaluate(model, test_loader)
+        tflops = calculate_tflops(model, torch.randn(32, 28 * 28))
+        total_comm = sum(communication_counts[c]['send'] + communication_counts[c]['receive'] for c in selected_clients)
 
-        # Calculate total communication
-        total_send = sum(communication_counts[c]['send'] - (communication_counts[c]['full_round'] - 1) for c in selected_clients)
-        total_receive = sum(communication_counts[c]['receive'] - (communication_counts[c]['full_round'] - 1) for c in selected_clients)
-        total_comm = total_send + total_receive
-        if results:
-            total_comm += results[-1]["TotalComm"]
-
-        # Aggregate global model
-        global_model = fed_avg(global_model, client_state_dicts, client_data_sizes)
-        
-        # Calculate accuracy on test data
-        loss, accuracy = evaluate(global_model, test_loader)
-
-        client_models, client_losses = [], []
-
-        # Loop through the clients and train their models
-        for cid, loader in client_loaders.items():
-            model = MLPModel()  # Initialize a new model for each client
-            model.load_state_dict(global_model.state_dict())  # Load the global model's parameters into the client's model
-            
-            # Train the model locally on the client's data
-            local_train(model, loader, epochs=1, lr=0.01)  # Perform local training
-            
-            # Append the trained model to the client_models list
-            client_models.append(model)
-            
-            # Evaluate the model to get the loss
-            loss, _ = evaluate(model, loader)
-            
-            # Append the loss to the client_losses list
-            client_losses.append(loss)
-
-        # Now calculate the GRC scores and weights using the trained models and their corresponding losses
-        grc_scores, grc_weights = calculate_GRC(global_model, client_models, client_losses)
-
-        # Extract the weights for Loss and Diff
-        w_loss, w_diff = grc_weights
-
-        # Store results for this round
-        result_dict = {
+        row = {
             "Round": r + 1,
-            "Accuracy": accuracy,
-            "TotalComm": total_comm,
-            "AvgTFlops": tflops,
-            "SelectedClients": selected_clients,
-            "ClientLosses": w_loss,  # Store the list of client losses
-            "ParamDiffs": w_diff  # You can update this if you compute param diffs
+            f"{prefix}_Accuracy": acc,
+            f"{prefix}_Loss": loss,
+            f"{prefix}_TFLOPs": tflops,
+            f"{prefix}_Comm": total_comm,
+            f"{prefix}_SelectedClients": selected_clients
         }
 
-        # Write the result to CSV
-        df = pd.DataFrame([result_dict])
-        # Getting current year month hour
-        current_time = datetime.now()
-        year = current_time.year
-        month = current_time.month
-        hour = current_time.hour
-        # Generate file name 
-        csv_filename = f"combined_training_data_{year}_{month}_{hour}.csv"
-        
-        # Create a new file at round 0; then append 
-        if r == 0:
-            df.to_csv(csv_filename, mode='w', header=True, index=False)
-        else:
-            df.to_csv(csv_filename, mode='a', header=False, index=False)
+        all_results.append(row)
 
-    return results
+    # --- Updating CSV ---
+    df_new = pd.DataFrame(all_results).set_index("Round")
+
+    if os.path.exists(csv_path):
+        df_existing = pd.read_csv(csv_path).set_index("Round")
+        df_combined = df_existing.combine_first(df_new) if not is_lora else df_existing.combine(df_new, lambda s1, s2: s1 if s1.notnull().all() else s2)
+    else:
+        df_combined = df_new
+
+    df_combined.reset_index().to_csv(csv_path, index=False)
 
 
 def main():
     torch.manual_seed(0)
     random.seed(0)
     np.random.seed(0)
-    
-    # 加载数据集、划分数据与构建 DataLoader
+
     train_data, test_data = load_mnist_data()
     client_datasets, client_data_sizes = split_data_by_label(train_data)
-    client_loaders = {client_id: data.DataLoader(dataset, batch_size=32, shuffle=True)
-                      for client_id, dataset in client_datasets.items()}
-    test_loader = data.DataLoader(test_data, batch_size=32, shuffle=False)
-    
-    rounds = 200  # 联邦学习轮数
-    
-    # setting experiments 
-    experiment_1 = run_experiment(
-        grc=True,
+    client_loaders = {cid: data.DataLoader(ds, batch_size=32, shuffle=True) for cid, ds in client_datasets.items()}
+    test_loader = data.DataLoader(test_data, batch_size=32)
+
+    # Initializing filename 
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    csv_filename = f"combined_results_{timestamp}.csv"
+
+    rounds = 200
+
+    # MLP
+    run_experiment(
+        grc=False,
         rounds=rounds,
         client_loaders=client_loaders,
         client_data_sizes=client_data_sizes,
-        test_loader=test_loader
+        test_loader=test_loader,
+        is_lora=False,
+        csv_path=csv_filename
     )
-    
-    # # Combine two results into one 
-    # combined_results = []
-    # for r in range(rounds):
-    #     row = {
-    #         "Round": exp_no_freeze[r]["Round"],
-    #         "Accuracy_NoFreeze": exp_no_freeze[r]["Accuracy"],
-    #         "TotalComm_NoFreeze": exp_no_freeze[r]["TotalComm"],
-    #         "Accuracy_Freeze": exp_freeze[r]["Accuracy"],
-    #         "TotalComm_Freeze": exp_freeze[r]["TotalComm"],
-    #     }
-    #     combined_results.append(row)
 
-    # # 绘制测试准确率随轮次变化对比图
-    # plt.figure(figsize=(10, 6))
-    # plt.plot(df["Round"], df["Accuracy_NoFreeze"], marker='o', label="No Freeze")
-    # # plt.plot(df["Round"], df["Accuracy_Freeze"], marker='s', label="Freeze (APF on fc2)")
-    # plt.xlabel("Federated Learning Rounds")
-    # plt.ylabel("Test Accuracy")
-    # plt.title("Test Accuracy vs Rounds")
-    # plt.legend()
-    # plt.grid(True)
-    # plt.show()
+    # LoRA
+    run_experiment(
+        grc=False,
+        rounds=rounds,
+        client_loaders=client_loaders,
+        client_data_sizes=client_data_sizes,
+        test_loader=test_loader,
+        is_lora=True,
+        csv_path=csv_filename
+    )
+
+    print(f"✅ 所有模型训练完成，结果保存至：{csv_filename}")
+
+
 
 if __name__ == "__main__":
     main()
