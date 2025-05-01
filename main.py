@@ -21,6 +21,7 @@ import csv
 import pandas as pd
 from datetime import datetime
 import torch.nn.functional as F
+from collections import OrderedDict
 
 
 class LoRALinear(nn.Module):
@@ -299,13 +300,20 @@ def select_clients(client_loaders, use_all_clients=False, num_select=None,
             local_model = MLPModel(use_lora=selection_lora, rank=rank)
             local_model.load_state_dict(global_model.state_dict())
 
-            # 训练时也使用对应的LoRA配置
-            local_train(local_model, loader, epochs=1, lr=0.01, use_lora=selection_lora)
+            # 训练5个epoch并计算平均loss
+            total_loss = 0.0
+            for epoch in range(3):
+                # 训练1个epoch
+                local_train(local_model, loader, epochs=1, lr=0.01, use_lora=selection_lora)
+                # 计算loss
+                loss, _ = evaluate(local_model, loader)
+                total_loss += loss
 
-            loss, _ = evaluate(local_model, loader)
-            client_losses[client_id] = loss
+            avg_loss = total_loss / 5
+            client_losses[client_id] = avg_loss
+
         selected_clients = sorted(client_losses, key=client_losses.get, reverse=True)[:num_select]
-        print(f"Selected {num_select} clients with the highest loss: {selected_clients}")
+        print(f"Selected {num_select} clients with the highest average loss (5 epochs): {selected_clients}")
     else:
         selected_clients = random.sample(list(client_loaders.keys()), num_select)
         print(f"Randomly selected {num_select} clients: {selected_clients}")
@@ -327,16 +335,16 @@ def main():
 
     # 参数配置
     config = {
-        'use_lora': False,  # 全局模型是否使用LoRA
-        'selection_lora': False,  # 客户端选择阶段是否使用LoRA
-        'training_lora': False,  # 客户端训练阶段是否使用LoRA
-        'rank': 8,  # LoRA的rank值
-        'lora_alpha': 0.5,  # LoRA的alpha值
-        'rounds': 300,  # 联邦学习轮数
-        'num_selected_clients': 2,  # 每轮选择客户端数量
-        'use_all_clients': False,  # 是否使用所有客户端
-        'use_loss_based_selection': False,  # 是否基于loss选择客户端
-        'grc': False  # 是否使用GRC选择客户端
+        'use_lora': False,
+        'selection_lora': False,
+        'training_lora': False,
+        'rank': 8,
+        'lora_alpha': 0.5,
+        'rounds': 100,
+        'num_selected_clients': 2,
+        'use_all_clients': False,
+        'use_loss_based_selection': True,
+        'grc': False
     }
 
     # 加载 MNIST 数据集
@@ -356,6 +364,7 @@ def main():
                             lora_alpha=config['lora_alpha'])
     global_accuracies = []
     total_communication_counts = []
+    selected_clients_history = []  # 新增：记录每轮选择的客户端
 
     # 初始化通信计数器
     communication_counts = {}
@@ -374,7 +383,7 @@ def main():
     for r in range(config['rounds']):
         print(f"\n🔄 第 {r + 1} 轮聚合")
 
-        # 选择客户端（可以独立配置是否使用LoRA）
+        # 选择客户端
         selected_clients = select_clients(
             client_loaders,
             use_all_clients=config['use_all_clients'],
@@ -382,28 +391,30 @@ def main():
             select_by_loss=config['use_loss_based_selection'],
             global_model=global_model,
             grc=config['grc'],
-            selection_lora=config['selection_lora'],  # 独立配置选择阶段的LoRA
+            selection_lora=config['selection_lora'],
             rank=config['rank']
         )
+        selected_clients_history.append(selected_clients)  # 记录选择的客户端
 
         update_communication_counts(communication_counts, selected_clients, "receive")
         client_state_dicts = []
 
-        # 客户端本地训练（可以独立配置是否使用LoRA）
+        # 客户端本地训练
         for client_id in selected_clients:
             client_loader = client_loaders[client_id]
-            local_model = MLPModel(use_lora=config['use_lora'],
-                                   rank=config['rank'],
-                                   lora_alpha=config['lora_alpha'])
+            local_model = MLPModel(
+                use_lora=config['use_lora'],
+                rank=config['rank'],
+                lora_alpha=config['lora_alpha']
+            )
             local_model.load_state_dict(global_model.state_dict())
 
-            # 训练时使用独立的LoRA配置
             local_state = local_train(
                 local_model,
                 client_loader,
                 epochs=1,
                 lr=0.1,
-                use_lora=config['training_lora']  # 独立配置训练阶段的LoRA
+                use_lora=config['training_lora']
             )
 
             client_state_dicts.append((client_id, local_state))
@@ -472,8 +483,9 @@ def main():
         print(
             f"Client {client_id}: Sent {counts['send']} times, Received {counts['receive']} times, Completed full_round {counts['full_round']} times")
 
-    # 可视化结果
-    plt.figure(figsize=(8, 5))
+    # 可视化结果 - 准确率曲线
+    plt.figure(figsize=(12, 5))
+    plt.subplot(1, 2, 1)
     plt.plot(range(1, config['rounds'] + 1), global_accuracies, marker='o', linestyle='-', color='b',
              label="Test Accuracy")
     plt.xlabel("Federated Learning Rounds")
@@ -481,18 +493,192 @@ def main():
     plt.title("Test Accuracy Over Federated Learning Rounds")
     plt.legend()
     plt.grid(True)
+
+    # 可视化结果 - 客户端选择情况
+    plt.subplot(1, 2, 2)
+    for r in range(config['rounds']):
+        for client_id in selected_clients_history[r]:
+            plt.scatter(r + 1, client_id, color='r', alpha=0.5)
+    plt.xlabel("Federated Learning Rounds")
+    plt.ylabel("Client ID")
+    plt.title("Selected Clients in Each Round")
+    plt.yticks(list(client_loaders.keys()))
+    plt.grid(True)
+
+    plt.tight_layout()
+    plt.savefig(f"training_results_{timestamp}.png")  # 保存图表
     plt.show()
 
-    plt.figure(figsize=(8, 5))
-    plt.plot(total_communication_counts, global_accuracies, marker='s', linestyle='-', color='r',
-             label="Test Accuracy vs. Communication")
-    plt.xlabel("Total Communication Count per Round")
-    plt.ylabel("Accuracy")
-    plt.title("Test Accuracy vs. Total Communication")
-    plt.legend()
-    plt.grid(True)
-    plt.show()
+    # 保存客户端选择历史
+    selection_history_df = pd.DataFrame({
+        'Round': range(1, config['rounds'] + 1),
+        'Selected_Clients': [",".join(map(str, clients)) for clients in selected_clients_history]
+    })
+    selection_history_df.to_csv(f"client_selection_history_{timestamp}.csv", index=False)
 
 
 if __name__ == "__main__":
     main()
+
+# import pandas as pd
+# import matplotlib.pyplot as plt
+# import numpy as np
+# import os
+# from datetime import datetime
+#
+# # 在这里设置需要比较的两个实验文件名
+# FILE1 = "training_data_20250501_093553.csv"
+# FILE2 = "training_data_20250501_095310.csv"
+#
+#
+# def load_experiment_data(filename):
+#     """加载实验数据文件"""
+#     if not os.path.exists(filename):
+#         raise FileNotFoundError(f"文件未找到: {filename}")
+#
+#     # 自动检测对应的客户端选择历史文件
+#     base_name = os.path.splitext(filename)[0]
+#
+#     # 提取完整的时间戳部分（包括日期和时间）
+#     if base_name.startswith("training_data_"):
+#         timestamp_part = "_".join(base_name.split('_')[2:])  # 获取"20250501_093553"部分
+#         selection_file = f"client_selection_history_{timestamp_part}.csv"
+#     else:
+#         selection_file = f"client_selection_history_{base_name}.csv"
+#
+#     if not os.path.exists(selection_file):
+#         raise FileNotFoundError(f"客户端选择历史文件未找到: {selection_file}")
+#
+#     df = pd.read_csv(filename)
+#     selection_df = pd.read_csv(selection_file)
+#     return df, selection_file, selection_df
+#
+#
+# def compare_experiments(file1, file2):
+#     """对比两次实验结果"""
+#     print("联邦学习实验结果对比工具")
+#     print("=" * 40)
+#
+#     # 获取实验名称（使用文件名作为标识）
+#     exp1_name = os.path.splitext(os.path.basename(file1))[0]
+#     exp2_name = os.path.splitext(os.path.basename(file2))[0]
+#
+#     print(f"\n对比实验: {exp1_name} vs {exp2_name}")
+#
+#     try:
+#         # 加载实验数据
+#         exp1_df, exp1_sel_file, exp1_selection = load_experiment_data(file1)
+#         exp2_df, exp2_sel_file, exp2_selection = load_experiment_data(file2)
+#
+#         print(f"\n已加载实验数据:")
+#         print(f"- {exp1_name}: 训练数据 {len(exp1_df)} 轮, 选择文件 {exp1_sel_file}")
+#         print(f"- {exp2_name}: 训练数据 {len(exp2_df)} 轮, 选择文件 {exp2_sel_file}")
+#
+#     except FileNotFoundError as e:
+#         print(f"\n错误: {e}")
+#         return
+#
+#     # 确保轮次一致
+#     min_rounds = min(len(exp1_df), len(exp2_df))
+#     exp1_df = exp1_df.head(min_rounds)
+#     exp2_df = exp2_df.head(min_rounds)
+#
+#     # 创建对比图表
+#     plt.figure(figsize=(15, 10))
+#     plt.suptitle(f"Experiment Comparison\n{exp1_name} vs {exp2_name}", fontsize=14)
+#
+#     # 1. Accuracy对比
+#     plt.subplot(2, 2, 1)
+#     plt.plot(exp1_df['Round'], exp1_df['Accuracy'], 'b-', label=exp1_name)
+#     plt.plot(exp2_df['Round'], exp2_df['Accuracy'], 'r-', label=exp2_name)
+#     plt.xlabel('Round')
+#     plt.ylabel('Accuracy (%)')
+#     plt.title('Accuracy Comparison')
+#     plt.legend()
+#     plt.grid(True)
+#
+#     # 2. Accuracy差异
+#     plt.subplot(2, 2, 2)
+#     accuracy_diff = exp1_df['Accuracy'] - exp2_df['Accuracy']
+#     plt.plot(exp1_df['Round'], accuracy_diff, 'g-')
+#     plt.axhline(0, color='k', linestyle='--', alpha=0.3)
+#     plt.xlabel('Round')
+#     plt.ylabel('Accuracy Difference (%)')
+#     plt.title(f'Accuracy Difference ({exp1_name} - {exp2_name})')
+#     plt.grid(True)
+#
+#     # 3. 客户端选择频率对比
+#     plt.subplot(2, 2, 3)
+#
+#     def get_selection_counts(selection_df):
+#         all_clients = []
+#         for clients in selection_df['Selected_Clients']:
+#             all_clients.extend([int(c) for c in str(clients).split(',')])
+#         unique, counts = np.unique(all_clients, return_counts=True)
+#         return dict(zip(unique, counts))
+#
+#     exp1_counts = get_selection_counts(exp1_selection)
+#     exp2_counts = get_selection_counts(exp2_selection)
+#
+#     all_clients = sorted(set(exp1_counts.keys()).union(set(exp2_counts.keys())))
+#     exp1_freq = [exp1_counts.get(c, 0) / min_rounds for c in all_clients]
+#     exp2_freq = [exp2_counts.get(c, 0) / min_rounds for c in all_clients]
+#
+#     bar_width = 0.35
+#     index = np.arange(len(all_clients))
+#
+#     plt.bar(index, exp1_freq, bar_width, label=exp1_name, alpha=0.7)
+#     plt.bar(index + bar_width, exp2_freq, bar_width, label=exp2_name, alpha=0.7)
+#     plt.xlabel('Client ID')
+#     plt.ylabel('Selection Frequency')
+#     plt.title('Client Selection Frequency Comparison')
+#     plt.xticks(index + bar_width / 2, all_clients)
+#     plt.legend()
+#     plt.grid(True, axis='y')
+#
+#     # 4. 客户端选择模式对比
+#     plt.subplot(2, 2, 4)
+#
+#     def get_selection_rounds(selection_df):
+#         client_rounds = {}
+#         for round_num, clients in zip(selection_df['Round'], selection_df['Selected_Clients']):
+#             for c in str(clients).split(','):
+#                 c = int(c)
+#                 if c not in client_rounds:
+#                     client_rounds[c] = []
+#                 client_rounds[c].append(round_num)
+#         return client_rounds
+#
+#     exp1_rounds = get_selection_rounds(exp1_selection)
+#     exp2_rounds = get_selection_rounds(exp2_selection)
+#
+#     for c in all_clients:
+#         if c in exp1_rounds:
+#             plt.scatter(exp1_rounds[c], [c] * len(exp1_rounds[c]), c='blue', alpha=0.5,
+#                         label=exp1_name if c == all_clients[0] else "")
+#         if c in exp2_rounds:
+#             plt.scatter(exp2_rounds[c], [c] * len(exp2_rounds[c]), c='red', alpha=0.5,
+#                         label=exp2_name if c == all_clients[0] else "")
+#
+#     plt.xlabel('Round')
+#     plt.ylabel('Client ID')
+#     plt.title('Client Selection Pattern Comparison')
+#     plt.yticks(all_clients)
+#     plt.legend()
+#     plt.grid(True)
+#
+#     plt.tight_layout()
+#
+#     # 保存对比结果
+#     ts1 = exp1_name.split('_')[-2] + "_" + exp1_name.split('_')[-1]  # 获取完整时间戳
+#     ts2 = exp2_name.split('_')[-2] + "_" + exp2_name.split('_')[-1]  # 获取完整时间戳
+#     comparison_filename = f"comparison_{ts1}_vs_{ts2}.png"
+#     plt.savefig(comparison_filename)
+#     print(f"\n对比结果已保存为: {comparison_filename}")
+#
+#     plt.show()
+#
+#
+# if __name__ == "__main__":
+#     # 直接使用预设的文件名进行比较
+#     compare_experiments(FILE1, FILE2)
