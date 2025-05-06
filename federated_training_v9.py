@@ -384,8 +384,8 @@ def main():
     rounds = 100  # 联邦学习轮数
     use_all_clients = False  # 是否进行客户端选择
     num_selected_clients = 2  # 每轮选择客户端训练数量
-    use_loss_based_selection = True  # 是否根据 loss 选择客户端
-    grc = False
+    use_loss_based_selection = False  # 是否根据 loss 选择客户端
+    grc = True
 
     # 初始化通信计数器
     communication_counts = {}
@@ -749,4 +749,4 @@ def main3():
 
 
 if __name__ == "__main__":
-    main2()
+    main()
