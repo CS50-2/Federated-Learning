@@ -21,6 +21,7 @@ import ssl
 from datetime import datetime
 import pandas as pd
 import torch.nn.functional as F
+import time
 
 
 class LoRALayer(nn.Module):
@@ -28,7 +29,9 @@ class LoRALayer(nn.Module):
         super().__init__()
         self.use_svd = use_svd  # Flag to decide if SVD should be used
         self.alpha = alpha
-        
+        self.rank = rank
+        self.scaling = alpha / rank
+
         if use_svd:
             # Initialize LoRA parameters using SVD
             source_linear = linear.weight.data
@@ -43,64 +46,67 @@ class LoRALayer(nn.Module):
             self.B = nn.Parameter((S_r @ V_r).contiguous())  # The B matrix (rank x out_dim) using S_r * V_r^T
         else:
             # Random initialization
-            std_dev = 1 / torch.sqrt(torch.tensor(rank).float())
-            self.A = nn.Parameter(torch.randn(in_dim, rank) * std_dev)
+            self.A = nn.Parameter(torch.zeros(in_dim, rank))
             self.B = nn.Parameter(torch.zeros(rank, out_dim))
-
-    # def forward(self, x):
-    #     x=self.alpha*(x@self.A@self.B)
-    #     return x
-
-
-class LinearWithLoRA(nn.Module):
-    def __init__(self, linear, rank, alpha, use_svd=False):
-        super().__init__()
-        self.linear = linear
-        self.lora = LoRALayer(linear.in_features, linear.out_features, rank, alpha, use_svd=use_svd, linear=linear)
+            nn.init.normal_(self.A, mean=0.0, std=0.02)
+            nn.init.zeros_(self.B)
 
     def forward(self, x):
-        # Apply LoRA to original weights
-        lora = self.lora.A @ self.lora.B # combine LoRA metrices
-        combined_weight = self.linear.weight + self.lora.alpha * lora
-        return F.linear(x, combined_weight, self.linear.bias)
+        x=self.scaling*(x@self.A@self.B)
+        return x
+
+
+# class LinearWithLoRA(nn.Module):
+#     def __init__(self, linear, rank, alpha, use_svd=False):
+#         super().__init__()
+#         self.linear = linear
+#         self.lora = LoRALayer(linear.in_features, linear.out_features, rank, alpha, use_svd=use_svd, linear=linear)
+
+#     def forward(self, x):
+#         # Apply LoRA to original weights
+#         combined_weight = self.linear.weight + self.lora.alpha * (self.lora.A @ self.lora.B).T
+#         return F.linear(x, combined_weight, self.linear.bias)
 
     
 # 定义 MLP 模型
 class MLPModel(nn.Module):
-    def __init__(self, is_LoRA=False, rank=4, alpha=8, use_svd=False):
+    def __init__(self):
         super(MLPModel, self).__init__()
-
-        self.is_LoRA = is_LoRA 
-        self.use_svd = use_svd 
-
-        if not self.is_LoRA:  # Use the original linear layers
-            self.fc1 = nn.Linear(28 * 28, 200)  # 第一层，输入维度 784 -> 200
-            self.fc2 = nn.Linear(200, 200)      # 第二层，200 -> 200
-            self.fc3 = nn.Linear(200, 10)       # 输出层，200 -> 10
-            self.relu = nn.ReLU()
-        else:  # Use LoRA-enhanced layers
-            self.fc1 = nn.Linear(28 * 28, 200)
-            self.fc2 = LinearWithLoRA(nn.Linear(200, 200), rank, alpha, use_svd=self.use_svd)
-            self.fc3 = nn.Linear(200, 10)
-            self.relu = nn.ReLU()
+        self.fc1 = nn.Linear(28 * 28, 200)  # 第一层，输入维度 784 -> 200
+        self.fc2 = nn.Linear(200, 200)  # 第二层，200 -> 200
+        self.fc3 = nn.Linear(200, 10)  # 输出层，200 -> 10
+        self.relu = nn.ReLU()
 
     def forward(self, x):
-        x = x.view(x.size(0), -1)  # Flatten the input (batch_size, 1, 28, 28) -> (batch_size, 784)
+        x = x.view(x.size(0), -1)  # 展平输入 (batch_size, 1, 28, 28) -> (batch_size, 784)
         x = self.relu(self.fc1(x))
         x = self.relu(self.fc2(x))
-        x = self.fc3(x)  # Direct output, no need for Softmax (CrossEntropyLoss already includes it)
+        x = self.fc3(x)  # 直接输出，不使用 Softmax（因为 PyTorch 的 CrossEntropyLoss 里已经包含了）
         return x
+    
+    # 定义带 LoRA 的 MLP 模型
+class LoRAMLPModel(nn.Module):
+    def __init__(self, base_model, rank=4, alpha=1):
+        super(LoRAMLPModel, self).__init__()
+        self.base_model = base_model
+        # 冻结基础模型参数
+        for param in base_model.parameters():
+            param.requires_grad = False
 
-def freeze_linear_layers(model):
-    """Freeze the original layers in the model, leaving only LoRA layers trainable."""
-    for child in model.children():
-        if isinstance(child, LinearWithLoRA):
-            # Freeze the original weights (linear layers)
-            for param in child.linear.parameters():
-                param.requires_grad = False # not accepting additional gradients 
-        else:
-            # Recursively freeze linear layers in children modules
-            freeze_linear_layers(child)
+        # 添加 LoRA 适配器
+        self.lora_fc1 = LoRALayer(28 * 28, 200, rank=rank, alpha=alpha)
+        self.lora_fc2 = LoRALayer(200, 200, rank=rank, alpha=alpha)
+        self.lora_fc3 = LoRALayer(200, 10, rank=rank, alpha=alpha)
+
+    def forward(self, x):
+        x = x.view(x.size(0), -1)  # 展平输入
+
+        # 前向传播结合基础模型和 LoRA 部分
+        fc1_out = self.base_model.relu(self.base_model.fc1(x) + self.lora_fc1(x))
+        fc2_out = self.base_model.relu(self.base_model.fc2(fc1_out) + self.lora_fc2(fc1_out))
+        out = self.base_model.fc3(fc2_out) + self.lora_fc3(fc2_out)
+
+        return out
 
 
 # 加载 MNIST 数据集
@@ -209,32 +215,47 @@ def split_data_by_label(dataset, num_clients=10):
     return client_data_subsets, client_actual_sizes
 
 
-def local_train(model, train_loader, epochs=5, lr=0.1, is_LoRA=False, freeze_W=False):
+def local_train(model, train_loader, epochs=5, lr=0.1, is_LoRA=False):
     """Train the model on a local client, freezing original layers if using LoRA."""
-    criterion = nn.CrossEntropyLoss()
 
-    if is_LoRA and freeze_W:  # If LoRA and freeze_W is enabled, freeze the original layers
-        freeze_linear_layers(model)
+    if is_LoRA: 
+        lora_model = LoRAMLPModel(model)
+
+        criterion = nn.CrossEntropyLoss()
+
         # Only update LoRA parameters (A and B)
-        params_to_update = [param for param in model.parameters() if param.requires_grad]
-        optimizer = optim.SGD(params_to_update, lr=lr)
-    elif is_LoRA and not freeze_W:
-        # Update LoRA parameters (A and B) and Weight 
-        params_to_update = [param for param in model.parameters() if param.requires_grad]
-        optimizer = optim.SGD(params_to_update, lr=lr)
+        optimizer = optim.SGD([p for n, p in lora_model.named_parameters() if p.requires_grad], lr=lr)
+
+        model.train()
+        loss_sq_sum = 0.0
+
+        for epoch in range(epochs):
+            for batch_x, batch_y in train_loader:
+                optimizer.zero_grad()
+                outputs = model(batch_x)
+                loss = criterion(outputs, batch_y)
+                loss.backward()
+                optimizer.step()
+                loss_sq_sum += loss.item() ** 2
+
+        h_i = loss_sq_sum  # 累积loss平方和
+        return model, h_i
     else: 
+        criterion = nn.CrossEntropyLoss()
+
         optimizer = optim.SGD(model.parameters(), lr=lr)
 
-    model.train()
-    for epoch in range(epochs):
-        for batch_x, batch_y in train_loader:
-            optimizer.zero_grad()
-            outputs = model(batch_x)
-            loss = criterion(outputs, batch_y)
-            loss.backward()
-            optimizer.step()
+        model.train()
 
-    return model.state_dict()
+        for epoch in range(epochs):
+            for batch_x, batch_y in train_loader:
+                optimizer.zero_grad()
+                outputs = model(batch_x)
+                loss = criterion(outputs, batch_y)
+                loss.backward()
+                optimizer.step()
+
+        return model.state_dict()
 
 # 联邦平均聚合函数
 def fed_avg(global_model, client_state_dicts, client_sizes):
@@ -366,18 +387,24 @@ def calculate_GRC(global_model, client_models, client_losses):
 
 
 def select_clients(client_loaders, use_all_clients=False, num_select=None,
-                   select_by_loss=False, global_model=None, grc=True, is_LoRA=False, use_svd=False, freeze_W=False):
+                   select_by_loss=False, global_model=None, grc=True, is_LoRA=False, use_svd=False):
     if grc:  # 使用 GRC 选择客户端
         client_models = []
         # 1. 训练本地模型并计算损失
         client_losses = []
         for client_id, client_loader in client_loaders.items():
-            local_model = MLPModel(is_LoRA=is_LoRA, use_svd=use_svd) # Define if using LoRA or SVD
-            local_model.load_state_dict(global_model.state_dict())  # 同步全局模型
-            local_train(local_model, client_loader, epochs=1, lr=0.01, is_LoRA=is_LoRA, freeze_W=freeze_W) # Define if using LoRA 
-            client_models.append(local_model)
-            loss, _ = evaluate(local_model, client_loader)
-            client_losses.append(loss)
+            if is_LoRA:
+                # 使用LoRA训练 - 减少训练成本
+                trained_lora_model, h_i = local_train(global_model, client_loader, epochs=5, lr=0.01, is_LoRA=is_LoRA)
+                client_models.append(trained_lora_model)
+                client_losses.append(h_i)
+            else: 
+                local_model = MLPModel() # Define if using LoRA or SVD
+                local_model.load_state_dict(global_model.state_dict())  # 同步全局模型
+                local_train(local_model, client_loader, epochs=1, lr=0.01, is_LoRA=is_LoRA) # Define if using LoRA 
+                client_models.append(local_model)
+                loss, _ = evaluate(local_model, client_loader)
+                client_losses.append(loss)
 
         # 2. 计算 GRC 分数
         grc_scores, grc_weights = calculate_GRC(global_model, client_models, client_losses)
@@ -401,10 +428,13 @@ def select_clients(client_loaders, use_all_clients=False, num_select=None,
 
     if select_by_loss and global_model:
         client_losses = {}
-        for client_id, loader in client_loaders.items():
-            loss, _ = evaluate(global_model, loader)
-            client_losses[client_id] = loss
 
+        for client_id, loader in client_loaders.items():
+            local_model = MLPModel()
+            local_model.load_state_dict(global_model.state_dict())
+            local_train(local_model, loader, epochs=5, lr=0.01)
+            loss, _ = evaluate(local_model, loader)
+            client_losses[client_id] = loss
         selected_clients = sorted(client_losses, key=client_losses.get, reverse=True)[:num_select]
         print(f"Selected {num_select} clients with the highest loss: {selected_clients}")
     else:
@@ -428,7 +458,15 @@ def update_communication_counts(communication_counts, selected_clients, event):
         if event == "send" and communication_counts[client_id]['receive'] > 0:
             communication_counts[client_id]['full_round'] += 1
 
-def run_experiment(selection_method, rounds=100, num_selected_clients=2, is_LoRA=False, use_svd=False, freeze_W=False):
+
+def print_lora_params(model, round_num, prefix="Global"):
+    print(f"\n[📦 {prefix} Model - Round {round_num}]")
+    for name, param in model.named_parameters():
+        if 'lora.A' in name or 'lora.B' in name:
+            print(f"{name}: norm={param.data.norm():.4f}")
+
+
+def run_experiment(selection_method, rounds=100, num_selected_clients=2, is_LoRA=False, use_svd=False):
     torch.manual_seed(0)
     random.seed(0)
     np.random.seed(0)
@@ -445,7 +483,8 @@ def run_experiment(selection_method, rounds=100, num_selected_clients=2, is_LoRA
     test_loader = data.DataLoader(test_data, batch_size=32, shuffle=False)
 
     # Initialize global model, communication_counts, and results storage
-    global_model = MLPModel(is_LoRA=is_LoRA, use_svd=use_svd) # Use LoRA & SVD or not   
+    global_model = MLPModel()
+
     global_accuracies = []
     total_communication_counts = []
     csv_data = []
@@ -466,7 +505,7 @@ def run_experiment(selection_method, rounds=100, num_selected_clients=2, is_LoRA
             # Use loss-based selection without GRC (select top 2 highest loss clients)
             selected_clients = select_clients(client_loaders, use_all_clients=False,
                                               num_select=num_selected_clients,
-                                              select_by_loss=True, global_model=global_model, grc=False, is_LoRA=is_LoRA, use_svd=use_svd, freeze_W=freeze_W)
+                                              select_by_loss=True, global_model=global_model, grc=False, is_LoRA=is_LoRA, use_svd=use_svd)
         elif selection_method == "fedavg":
             # Use FedAvg with either random selection or all clients.
             # Using all clients or random selection for FedAvg.
@@ -478,15 +517,19 @@ def run_experiment(selection_method, rounds=100, num_selected_clients=2, is_LoRA
         update_communication_counts(communication_counts, selected_clients, "receive")
         client_state_dicts = []
 
+        print_lora_params(global_model, r+1, prefix="Before")
+
         # Perform local training on selected clients
         for client_id in selected_clients:
             client_loader = client_loaders[client_id]
-            local_model = MLPModel(is_LoRA=is_LoRA, use_svd=use_svd) # Use LoRA & SVD or not   
+            local_model = MLPModel()  
             local_model.load_state_dict(global_model.state_dict())  # Sync with the global model
             local_train(local_model, client_loader, epochs=1, lr=0.01, is_LoRA=is_LoRA)
             client_state_dicts.append((client_id, local_model.state_dict()))
             update_communication_counts(communication_counts, [client_id], "send")
             print(f"Client {client_id} trained.")
+        
+        print_lora_params(global_model, r+1, prefix="After")
 
         # Compute communication counts for this round
         total_send = sum(communication_counts[c]['send'] - (communication_counts[c]['full_round'] - 1)
@@ -513,20 +556,39 @@ def run_experiment(selection_method, rounds=100, num_selected_clients=2, is_LoRA
 
 def main_experiments():
     
-    rounds = 200
+    rounds = 10
     # Run experiments for each method
     # df_high_loss = run_experiment("high_loss", rounds, num_selected_clients=2)
-    # df_lora = run_experiment("fedGRA", rounds, num_selected_clients=2, is_LoRA=True, freeze_W=True)
     # df_lora_svd = run_experiment("high_loss", rounds, num_selected_clients=2, is_LoRA=True, use_svd=True, freeze_W=True)
-    df_lora_svd = run_experiment("fedGRA", rounds, num_selected_clients=2, is_LoRA=True, use_svd=True, freeze_W=True)
 
-    
+    start_time_1 = time.time()
+    df_lora = run_experiment("high_loss", rounds, num_selected_clients=2, is_LoRA=True)
+    end_time_1 = time.time()
+
+    # start_time_2 = time.time()
+    # df_lora_svd = run_experiment("fedGRA", rounds, num_selected_clients=2, is_LoRA=True, use_svd=True, freeze_W=True)
+    # end_time_2 = time.time()
+
+    # start_time_3 = time.time()
+    # df_lora_W = run_experiment("fedGRA", rounds, num_selected_clients=2, is_LoRA=True, freeze_W=False)
+    # end_time_3 = time.time()
+
+    start_time_4 = time.time()
+    df_GRA = run_experiment("high_loss", rounds, num_selected_clients=2)
+    end_time_4 = time.time()
+
+
     # Merge DataFrames on 'Round'
-    # df_combined = df_lora.merge(df_lora_svd, on='Round').merge(df_lora_W, on='Round')
-    df_combined = df_lora_svd
+    # df_combined = df_lora.merge(df_lora_svd, on='Round').merge(df_lora_W, on='Round').merge(df_GRA, on='Round', suffixes=('_fedGRA', '_fedGRA_pure'))
+    df_combined = df_lora.merge(df_GRA, on='Round')
 
     # Save to CSV for later inspection if needed
     df_combined.to_csv("comparison_results_test.csv", index=False)
+
+    print(f"LoRA GRA Freeze Original Weight Experiment took {end_time_1 - start_time_1:.2f} .")
+    # print(f"LoRA SVD GRA Freeze Original Weight Experiment took {end_time_2 - start_time_2:.2f} .")
+    # print(f"LoRA SVD GRA NOT Freeze Original Weight Experiment took {end_time_3 - start_time_3:.2f} .")
+    print(f"Pure GRA Experiment took {end_time_4 - start_time_4:.2f} .")
 
 if __name__ == "__main__":
     main_experiments()
