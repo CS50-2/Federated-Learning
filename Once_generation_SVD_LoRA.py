@@ -12,6 +12,7 @@ import csv
 import pandas as pd
 from datetime import datetime
 import time
+from copy import deepcopy
 
 
 # 定义 MLP 模型
@@ -32,52 +33,13 @@ class MLPModel(nn.Module):
 
 
 class LoRALayer(nn.Module):
-    def __init__(self, in_features, out_features, rank=4, alpha=1, use_svd=False, base_linear=None):
-        super(LoRALayer, self).__init__()
+    def __init__(self, A=None, B=None, alpha=1, rank=4):
+        super().__init__()
         self.rank = rank
         self.alpha = alpha
         self.scaling = alpha / rank
-        self.use_svd = use_svd
-
-        if self.use_svd and base_linear is not None:
-            # Initialize LoRA parameters using SVD
-            
-            # svd_start_time = time.time()
-            W = base_linear.weight.data.float()  # [out_features, in_features]
-            V, S, U= torch.svd(W)  # V: [rank: 200, out:200], S: [rank: 200, rank: 200], U: [in: 784, rank: 200], W: [out: 200, in: 784]
-            # svd_end_time = time.time()
-
-            # svd_time = svd_end_time - svd_start_time
-            # print("SVD: " + str(svd_time))
-
-            # print("W shape:", W.shape)
-            # print("U shape:", U.shape)
-            # print("S shape:", S.shape)
-            # print("Vh shape:", V.shape)
-
-            # Truncate
-            U_r = U[:, :rank]              # [out_features, rank]
-            S_r = torch.diag(S[:rank])     # [rank, rank]
-            V_r = V[:, :rank].t()          # [rank, in_features]
-
-            # print("W shape:", W.shape)
-            # print("U_r shape:", U_r.shape)
-            # print("S_r shape:", S_r.shape)
-            # print("V_r shape:", V_r.shape)
-            
-            # Use SVD components to initialize A and B
-            A = U_r# [in_features, rank]
-            B = (S_r @ V_r)  # [rank, out_features]
-            
-            self.A = nn.Parameter(A.contiguous()* 0.01)
-            self.B = nn.Parameter(B.contiguous())
-
-        else:
-            self.A = nn.Parameter(torch.zeros(in_features, rank))
-            self.B = nn.Parameter(torch.zeros(rank, out_features))
-            nn.init.normal_(self.A, mean=0.0, std=0.02)
-            nn.init.zeros_(self.B)
-    
+        self.A = nn.Parameter(A.clone())
+        self.B = nn.Parameter(B.clone())
 
     def forward(self, x):
         return x @ (self.A @ self.B) * self.scaling # [in, rank] @ [rank, out]
@@ -86,17 +48,20 @@ class LoRALayer(nn.Module):
 
 # 定义带 LoRA 的 MLP 模型
 class LoRAMLPModel(nn.Module):
-    def __init__(self, base_model, rank=4, alpha=1, use_svd=True):
+    def __init__(self, base_model, rank=4, alpha=1, lora_AB_dict=None):
         super(LoRAMLPModel, self).__init__()
         self.base_model = base_model
         
         for param in base_model.parameters():
             param.requires_grad = False
+        
+        A1, B1 = lora_AB_dict['fc1']
+        A2, B2 = lora_AB_dict['fc2']
+        A3, B3 = lora_AB_dict['fc3']
 
-        # 使用 base_model 的权重进行 SVD 初始化
-        self.lora_fc1 = LoRALayer(28 * 28, 200, rank=rank, alpha=alpha, use_svd=use_svd, base_linear=base_model.fc1)
-        self.lora_fc2 = LoRALayer(200, 200, rank=rank, alpha=alpha, use_svd=use_svd, base_linear=base_model.fc2)
-        self.lora_fc3 = LoRALayer(200, 10, rank=rank, alpha=alpha, use_svd=use_svd, base_linear=base_model.fc3)
+        self.lora_fc1 = LoRALayer(A1, B1, alpha=alpha, rank=rank)
+        self.lora_fc2 = LoRALayer(A2, B2, alpha=alpha, rank=rank)
+        self.lora_fc3 = LoRALayer(A3, B3, alpha=alpha, rank=rank)
 
     def forward(self, x):
         x = x.view(x.size(0), -1)  # 展平输入
@@ -204,9 +169,9 @@ def local_train(model, train_loader, epochs=5, lr=0.01):
 
 
 # LoRA训练函数 (只训练LoRA参数，用于客户端选择阶段)
-def local_train_lora(base_model, train_loader, epochs=2, lr=0.01, rank=4, alpha=1):
+def local_train_lora(base_model, train_loader, epochs=2, lr=0.01, rank=4, alpha=1, lora_AB_dict=None):
     # 创建LoRA模型
-    lora_model = LoRAMLPModel(base_model, rank=rank, alpha=alpha)
+    lora_model = LoRAMLPModel(base_model, rank=rank, alpha=alpha,lora_AB_dict=deepcopy(lora_AB_dict))
 
     criterion = nn.CrossEntropyLoss()
     # 只优化LoRA参数
@@ -229,9 +194,9 @@ def local_train_lora(base_model, train_loader, epochs=2, lr=0.01, rank=4, alpha=
 
 
 # 实时记录训练过程中的loss用做FedGRA (使用LoRA)
-def local_train_fedgra_loss_lora(model, train_loader, epochs=2, lr=0.01, rank=4, alpha=1):
+def local_train_fedgra_loss_lora(model, train_loader, epochs=2, lr=0.01, rank=4, alpha=1, lora_AB_dict=None):
     # 使用LoRA模型进行轻量级训练
-    lora_model, h_i = local_train_lora(model, train_loader, epochs=epochs, lr=lr, rank=rank, alpha=alpha)
+    lora_model, h_i = local_train_lora(model, train_loader, epochs=epochs, lr=lr, rank=rank, alpha=alpha, lora_AB_dict=lora_AB_dict)
     return lora_model, h_i
 
 
@@ -364,7 +329,7 @@ def calculate_GRC(global_model, client_lora_models, client_losses):
 # 客户端选择器 (使用LoRA)
 def select_clients(client_loaders, use_all_clients=False, num_select=None,
                    select_by_loss=False, global_model=None, grc=False,
-                   fairness_tracker=None, lora_rank=4, lora_alpha=1):
+                   fairness_tracker=None, lora_rank=4, lora_alpha=1, lora_AB_dict=None):
     if grc:  # 使用 GRC 选择客户端
         client_lora_models = []
         # 1. 使用LoRA训练本地模型并计算损失 (轻量级训练)
@@ -372,7 +337,7 @@ def select_clients(client_loaders, use_all_clients=False, num_select=None,
         for client_id, client_loader in client_loaders.items():
             # 使用LoRA训练 - 减少训练成本
             trained_lora_model, h_i = local_train_fedgra_loss_lora(
-                global_model, client_loader, epochs=2, lr=0.01, rank=lora_rank, alpha=lora_alpha
+                global_model, client_loader, epochs=2, lr=0.01, rank=lora_rank, alpha=lora_alpha, lora_AB_dict=lora_AB_dict
             )
             client_lora_models.append(trained_lora_model)
             client_losses.append(h_i)
@@ -424,6 +389,38 @@ def update_communication_counts(communication_counts, selected_clients, event):
             communication_counts[client_id]['full_round'] += 1
 
 
+def extract_lora_from_linear(base_linear: nn.Linear, rank=4, alpha=1.0):
+
+    W = base_linear.weight.data.float()  # [out_features, in_features]
+    V, S, U= torch.svd(W)  # V: [rank: 200, out:200], S: [rank: 200, rank: 200], U: [in: 784, rank: 200], W: [out: 200, in: 784]
+
+    print("W shape:", W.shape)
+    print("U shape:", U.shape)
+    print("S shape:", S.shape)
+    print("Vh shape:", V.shape)
+
+    # Truncate
+    U_r = U[:, :rank]              # [out_features, rank]
+    S_r = torch.diag(S[:rank])     # [rank, rank]
+    V_r = V[:, :rank].t()          # [rank, in_features]
+
+    print("W shape:", W.shape)
+    print("U_r shape:", U_r.shape)
+    print("S_r shape:", S_r.shape)
+    print("V_r shape:", V_r.shape)
+        
+    # Use SVD components to initialize A and B
+    A = U_r # [in_features, rank]
+    B = (S_r @ V_r)  # [rank, out_features]
+        
+    A_res = A.contiguous()* 0.01
+    B_res = B.contiguous()
+
+    print("Acticate SVD !!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+
+    return A_res, B_res
+    
+
 def main():
     torch.manual_seed(0)
     random.seed(0)
@@ -444,7 +441,7 @@ def main():
     global_model = MLPModel()
     global_accuracies = []  # 记录每轮全局模型的测试集准确率
     total_communication_counts = []  # 记录每轮客户端通信次数
-    rounds = 300 # 联邦学习轮数
+    rounds = 50 # 联邦学习轮数
     use_all_clients = False  # 是否进行客户端选择
     num_selected_clients = 2  # 每轮选择客户端训练数量
     use_loss_based_selection = False  # 是否根据 loss 选择客户端
@@ -469,6 +466,13 @@ def main():
     csv_data = []
 
     for r in range(rounds):
+        # One time SVD generation of AB from global model 
+        lora_AB_dict = {
+            'fc1': extract_lora_from_linear(global_model.fc1),
+            'fc2': extract_lora_from_linear(global_model.fc2),
+            'fc3': extract_lora_from_linear(global_model.fc3),
+        }
+        
         print(f"\n🔄 第 {r + 1} 轮聚合")
         # 选择客户端 (使用LoRA减少计算成本)
         selected_clients = select_clients(
@@ -479,7 +483,8 @@ def main():
             global_model=global_model,
             grc=grc, 
             lora_rank=lora_rank,
-            lora_alpha=lora_alpha
+            lora_alpha=lora_alpha, 
+            lora_AB_dict=lora_AB_dict
         )
 
         # 记录客户端接收通信次数
