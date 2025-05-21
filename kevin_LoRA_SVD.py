@@ -86,7 +86,7 @@ class LoRALayer(nn.Module):
 
 # 定义带 LoRA 的 MLP 模型
 class LoRAMLPModel(nn.Module):
-    def __init__(self, base_model, rank=4, alpha=1, use_svd=True):
+    def __init__(self, base_model, rank=4, alpha=1, use_svd=False):
         super(LoRAMLPModel, self).__init__()
         self.base_model = base_model
         
@@ -445,10 +445,12 @@ def main():
     global_accuracies = []  # 记录每轮全局模型的测试集准确率
     total_communication_counts = []  # 记录每轮客户端通信次数
     rounds = 300 # 联邦学习轮数
-    use_all_clients = False  # 是否进行客户端选择
-    num_selected_clients = 2  # 每轮选择客户端训练数量
+    use_all_clients = True  # 是否进行客户端选择
+    num_selected_clients = 10  # 每轮选择客户端训练数量
     use_loss_based_selection = False  # 是否根据 loss 选择客户端
-    grc = True
+    grc = False
+
+    start_time = time.time() # Starting time 
 
     # LoRA超参数
     lora_rank = 4  # LoRA秩
@@ -530,17 +532,20 @@ def main():
             w_loss = 'NA'
             w_diff = 'NA'
 
+        elapsed_time = time.time() - start_time
+
         csv_data.append([
             r + 1,
             accuracy,
             total_comm,
             ",".join(map(str, selected_clients)),
             w_loss,
-            w_diff
+            w_diff,
+            round(elapsed_time, 2) 
         ])
         df = pd.DataFrame(csv_data, columns=[
             'Round', 'Accuracy', 'Total communication counts', 'Selected Clients',
-            'GRC Weight - Loss', 'GRC Weight - Diff'])
+            'GRC Weight - Loss', 'GRC Weight - Diff', 'Elapsed Time (s)'])
         df.to_csv(csv_filename, index=False)
 
     # 输出最终模型的性能
@@ -581,4 +586,5 @@ if __name__ == "__main__":
     main()
     T2 = time.time()
     print('程序运行时间:%s秒' % ((T2 - T1)))
-    #1520.884345293045
+    #程序运行时间:341.9568917751312秒 - SVD 
+    # 

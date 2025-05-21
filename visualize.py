@@ -233,7 +233,7 @@ def update_chart(line_enables, line_xs, line_ys, data_json):
         if (enable is not None and 'show' in enable) and x_col and y_col:
             fig.add_trace(go.Scatter(
                 x=df[x_col],
-                y=df[y_col],
+                y=df[y_col].rolling(window=10, min_periods=1).mean(), 
                 mode='lines',
                 name=f"Line {i+1}: {x_col} vs {y_col}"
             ))
@@ -286,7 +286,7 @@ def update_filtered_chart(n_clicks, x_lower, x_upper, data_json, line_enables, l
             if not filtered_df.empty:
                 fig.add_trace(go.Scatter(
                     x=filtered_df[x_col],
-                    y=filtered_df[y_col],
+                    y=filtered_df[y_col].rolling(window=10, min_periods=1).mean(),
                     mode='lines',
                     name=f"{x_col} vs {y_col}"
                 ))

@@ -394,29 +394,29 @@ def extract_lora_from_linear(base_linear: nn.Linear, rank=4, alpha=1.0):
     W = base_linear.weight.data.float()  # [out_features, in_features]
     V, S, U= torch.svd(W)  # V: [rank: 200, out:200], S: [rank: 200, rank: 200], U: [in: 784, rank: 200], W: [out: 200, in: 784]
 
-    print("W shape:", W.shape)
-    print("U shape:", U.shape)
-    print("S shape:", S.shape)
-    print("Vh shape:", V.shape)
+    # print("W shape:", W.shape)
+    # print("U shape:", U.shape)
+    # print("S shape:", S.shape)
+    # print("Vh shape:", V.shape)
 
     # Truncate
     U_r = U[:, :rank]              # [out_features, rank]
     S_r = torch.diag(S[:rank])     # [rank, rank]
     V_r = V[:, :rank].t()          # [rank, in_features]
 
-    print("W shape:", W.shape)
-    print("U_r shape:", U_r.shape)
-    print("S_r shape:", S_r.shape)
-    print("V_r shape:", V_r.shape)
+    # print("W shape:", W.shape)
+    # print("U_r shape:", U_r.shape)
+    # print("S_r shape:", S_r.shape)
+    # print("V_r shape:", V_r.shape)
         
     # Use SVD components to initialize A and B
     A = U_r # [in_features, rank]
     B = (S_r @ V_r)  # [rank, out_features]
         
-    A_res = A.contiguous()* 0.01
+    A_res = A.contiguous()* 0.1
     B_res = B.contiguous()
 
-    print("Acticate SVD !!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+    # print("Acticate SVD !!!!!!!!!!!!!!!!!!!!!!!!!!!!")
 
     return A_res, B_res
     
@@ -441,11 +441,13 @@ def main():
     global_model = MLPModel()
     global_accuracies = []  # 记录每轮全局模型的测试集准确率
     total_communication_counts = []  # 记录每轮客户端通信次数
-    rounds = 50 # 联邦学习轮数
+    rounds = 300 # 联邦学习轮数
     use_all_clients = False  # 是否进行客户端选择
     num_selected_clients = 2  # 每轮选择客户端训练数量
     use_loss_based_selection = False  # 是否根据 loss 选择客户端
     grc = True
+
+    start_time = time.time() # Starting time 
 
     # LoRA超参数
     lora_rank = 4  # LoRA秩
@@ -472,7 +474,7 @@ def main():
             'fc2': extract_lora_from_linear(global_model.fc2),
             'fc3': extract_lora_from_linear(global_model.fc3),
         }
-        
+
         print(f"\n🔄 第 {r + 1} 轮聚合")
         # 选择客户端 (使用LoRA减少计算成本)
         selected_clients = select_clients(
@@ -486,6 +488,8 @@ def main():
             lora_alpha=lora_alpha, 
             lora_AB_dict=lora_AB_dict
         )
+
+        elapsed_time = time.time() - start_time
 
         # 记录客户端接收通信次数
         update_communication_counts(communication_counts, selected_clients, "receive")
@@ -541,11 +545,12 @@ def main():
             total_comm,
             ",".join(map(str, selected_clients)),
             w_loss,
-            w_diff
+            w_diff, 
+            round(elapsed_time, 2) 
         ])
         df = pd.DataFrame(csv_data, columns=[
             'Round', 'Accuracy', 'Total communication counts', 'Selected Clients',
-            'GRC Weight - Loss', 'GRC Weight - Diff'])
+            'GRC Weight - Loss', 'GRC Weight - Diff', 'Elapsed Time (s)'])
         df.to_csv(csv_filename, index=False)
 
     # 输出最终模型的性能
@@ -575,7 +580,7 @@ def main():
     #          label="Test Accuracy vs. Communication")
     # plt.xlabel("Total Communication Count per Round")
     # plt.ylabel("Accuracy")
-    # plt.title("Test Accuracy vs. Total Communication")
+    # plt.title("Test Accuracy vs. Total Communication")s
     # plt.legend()
     # plt.grid(True)
     # plt.show()
@@ -586,4 +591,4 @@ if __name__ == "__main__":
     main()
     T2 = time.time()
     print('程序运行时间:%s秒' % ((T2 - T1)))
-    #1520.884345293045
+    # 程序运行时间:328.0528028011322秒
