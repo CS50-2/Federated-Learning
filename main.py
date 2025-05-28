@@ -1671,13 +1671,14 @@ class SVDCache:
 
 class LoRALayer(nn.Module):
     def __init__(self, in_features, out_features, rank=4, alpha=1, use_svd=False, base_linear=None, svd_cache=None,
-                 layer_name=None):
+                 layer_name=None, r_in = 4):
         super(LoRALayer, self).__init__()
         self.rank = rank
         self.alpha = alpha
         self.scaling = alpha / rank
         self.use_svd = use_svd
         self.relu = nn.ReLU()
+        self.r_in = r_in
 
         self.base_bias = None
         if base_linear is not None and base_linear.bias is not None:
@@ -1686,12 +1687,31 @@ class LoRALayer(nn.Module):
         if self.use_svd and base_linear is not None and svd_cache is not None:
             U_r, S_r, V_r = svd_cache.get_svd(layer_name, base_linear, rank)
 
-            sqrt_S = torch.sqrt(S_r)  # [rank, rank] 对角矩阵
-            A = U_r @ sqrt_S  # [out_features, rank]
-            B = sqrt_S @ V_r  # [rank, in_features]
+            # sqrt_S = torch.sqrt(S_r)  # [rank, rank] 对角矩阵
+            # A = U_r @ sqrt_S  # [out_features, rank]
+            # B = sqrt_S @ V_r  # [rank, in_features]
 
-            self.A = nn.Parameter(A.contiguous())
-            self.B = nn.Parameter(B.contiguous())
+            A_outer = U_r.clone()  # [in_features, r_out]
+            B_outer = V_r.clone()  # [r_out, out_features]
+
+            S_diag = torch.sqrt(S_r)  # [r_out, r_out]
+
+            # Step 5: 内层LoRA初始化（可训练参数）
+            # 使用论文中的分割策略
+            if rank % r_in == 0:
+                # 均匀分割
+                step_size = rank // r_in
+                A_inner = S_diag[:, ::step_size][:, :r_in]  # [r_out, r_in]
+                B_inner = S_diag[::step_size, :][:r_in, :]  # [r_in, r_out]
+            else:
+                # 顺序分割
+                A_inner = S_diag[:, :r_in]  # [r_out, r_in]
+                B_inner = S_diag[:r_in, :]  # [r_in, r_out]
+
+            self.A_inner = nn.Parameter(A_inner.contiguous())
+            self.B_inner = nn.Parameter(B_inner.contiguous())
+            self.A_outer = nn.Parameter(A_outer.contiguous(), requires_grad=False)
+            self.B_outer = nn.Parameter(B_outer.contiguous(), requires_grad=False)
 
         else:
             self.A = nn.Parameter(torch.zeros(in_features, rank))
@@ -1700,7 +1720,7 @@ class LoRALayer(nn.Module):
             nn.init.zeros_(self.B)
 
     def forward(self, x):
-        AB = self.A @ self.B  # [in, rank] @ [rank, out]
+        AB = self.A_outer @ self.A_inner @ self.B_inner @ self.B_outer
         output =AB @ x.T
         if self.base_bias is not None:
             output += self.base_bias.unsqueeze(1)
@@ -1709,7 +1729,7 @@ class LoRALayer(nn.Module):
 
 # 定义带 LoRA 的 MLP 模型
 class LoRAMLPModel(nn.Module):
-    def __init__(self, base_model, rank=4, alpha=1, use_svd=True, svd_cache=None):
+    def __init__(self, base_model, rank=4, alpha=1, use_svd=True, svd_cache=None,r_in = 4):
         super(LoRAMLPModel, self).__init__()
         self.base_model = base_model
 
@@ -1718,11 +1738,11 @@ class LoRAMLPModel(nn.Module):
 
         # 使用SVD缓存
         self.lora_fc1 = LoRALayer(28 * 28, 200, rank=rank, alpha=alpha, use_svd=use_svd,
-                                  base_linear=base_model.fc1, svd_cache=svd_cache, layer_name='fc1')
+                                  base_linear=base_model.fc1, svd_cache=svd_cache, layer_name='fc1',r_in = r_in)
         self.lora_fc2 = LoRALayer(200, 200, rank=rank, alpha=alpha, use_svd=use_svd,
-                                  base_linear=base_model.fc2, svd_cache=svd_cache, layer_name='fc2')
+                                  base_linear=base_model.fc2, svd_cache=svd_cache, layer_name='fc2',r_in = r_in)
         # self.lora_fc3 = LoRALayer(28 * 28, 10, rank=rank, alpha=alpha, use_svd=use_svd,
-        #                           base_linear=base_model.fc3, svd_cache=svd_cache, layer_name='fc3')
+        #                           base_linear=base_model.fc3, svd_cache=svd_cache, layer_name='fc3',r_in = r_in)
         self.fc3_2 = nn.Linear(200, 10)
 
     def forward(self, x):
@@ -1831,9 +1851,9 @@ def local_train(model, train_loader, epochs=5, lr=0.01):
 
 
 # LoRA训练函数 (只训练LoRA参数，用于客户端选择阶段)
-def local_train_lora(base_model, train_loader, epochs=2, lr=0.01, rank=4, alpha=1, svd_cache=None):
+def local_train_lora(base_model, train_loader, epochs=2, lr=0.01, rank=4, alpha=1, svd_cache=None,r_in = 4):
     # 创建LoRA模型
-    lora_model = LoRAMLPModel(base_model, rank=rank, alpha=alpha, svd_cache=svd_cache)
+    lora_model = LoRAMLPModel(base_model, rank=rank, alpha=alpha, svd_cache=svd_cache,r_in = r_in)
 
     criterion = nn.CrossEntropyLoss()
     # 只优化LoRA参数
@@ -1856,10 +1876,10 @@ def local_train_lora(base_model, train_loader, epochs=2, lr=0.01, rank=4, alpha=
 
 
 # 实时记录训练过程中的loss用做FedGRA (使用LoRA)
-def local_train_fedgra_loss_lora(model, train_loader, epochs=2, lr=0.01, rank=4, alpha=1, svd_cache=None):
+def local_train_fedgra_loss_lora(model, train_loader, epochs=2, lr=0.01, rank=4, alpha=1, svd_cache=None,r_in = 4):
     # 使用LoRA模型进行轻量级训练
     lora_model, h_i = local_train_lora(model, train_loader, epochs=epochs, lr=lr, rank=rank, alpha=alpha,
-                                       svd_cache=svd_cache)
+                                       svd_cache=svd_cache,r_in = r_in)
     return lora_model, h_i
 
 
@@ -1940,14 +1960,18 @@ def calculate_GRC(global_model, client_lora_models, client_losses, initial_lora_
             }
 
             for layer_name, lora_layer in lora_layers.items():
-                current_AB = lora_layer.A @ lora_layer.B  # [in_features, out_features]
-                A_name = f"{layer_name}.A"
-                B_name = f"{layer_name}.B"
+                current_AB = lora_layer.A_outer @ lora_layer.A_inner @ lora_layer.B_inner @ lora_layer.B_outer  # [in_features, out_features]
+                A_outer_name = f"{layer_name}.A_outer"
+                A_inner_name = f"{layer_name}.A_inner"
+                B_outer_name = f"{layer_name}.B_outer"
+                B_inner_name = f"{layer_name}.B_inner"
 
-                if A_name in initial_lora_params and B_name in initial_lora_params:
-                    initial_A = initial_lora_params[A_name]
-                    initial_B = initial_lora_params[B_name]
-                    initial_AB = initial_A @ initial_B
+                if A_outer_name in initial_lora_params and B_outer_name in initial_lora_params:
+                    initial_A_outer = initial_lora_params[A_outer_name]
+                    initial_B_outer = initial_lora_params[B_outer_name]
+                    initial_A_inner = initial_lora_params[A_inner_name]
+                    initial_B_inner = initial_lora_params[B_inner_name]
+                    initial_AB = initial_A_outer @ initial_A_inner @ initial_B_inner @ initial_B_outer
 
                     # 计算AB乘积的差异
                     diff = current_AB - initial_AB
@@ -2038,7 +2062,7 @@ def calculate_GRC(global_model, client_lora_models, client_losses, initial_lora_
 # 客户端选择器 (使用LoRA)
 def select_clients(client_loaders, use_all_clients=False, num_select=None,
                    select_by_loss=False, global_model=None, grc=False,
-                   fairness_tracker=None, lora_rank=4, lora_alpha=1):
+                   fairness_tracker=None, lora_rank=4, lora_alpha=1,r_in = 4):
     if grc:  # 使用 GRC 选择客户端
         client_lora_models = []
 
@@ -2060,7 +2084,7 @@ def select_clients(client_loaders, use_all_clients=False, num_select=None,
             # 使用LoRA训练 - 减少训练成本，并传递SVD缓存
             trained_lora_model, h_i = local_train_fedgra_loss_lora(
                 global_model, client_loader, epochs=5, lr=0.0005,
-                rank=lora_rank, alpha=lora_alpha, svd_cache=svd_cache
+                rank=lora_rank, alpha=lora_alpha, svd_cache=svd_cache,r_in = r_in
             )
             client_lora_models.append(trained_lora_model)
             client_losses.append(h_i)
@@ -2140,7 +2164,8 @@ def main():
 
     # LoRA超参数
     lora_rank = 180  # LoRA秩
-    lora_alpha = 16  # LoRA缩放因子
+    lora_alpha = 16
+    r_in = 50
 
     # 初始化通信计数器
     communication_counts = {}
@@ -2167,7 +2192,8 @@ def main():
             global_model=global_model,
             grc=grc,
             lora_rank=lora_rank,
-            lora_alpha=lora_alpha
+            lora_alpha=lora_alpha,
+            r_in = r_in
         )
 
         # 记录客户端接收通信次数
