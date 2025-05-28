@@ -1679,18 +1679,16 @@ class LoRALayer(nn.Module):
         self.use_svd = use_svd
         self.relu = nn.ReLU()
 
-        # Store the base layer's bias if it exists
         self.base_bias = None
         if base_linear is not None and base_linear.bias is not None:
             self.base_bias = base_linear.bias.detach().clone()
 
         if self.use_svd and base_linear is not None and svd_cache is not None:
-            # 使用缓存的SVD结果初始化LoRA参数
             U_r, S_r, V_r = svd_cache.get_svd(layer_name, base_linear, rank)
 
-            # 使用SVD结果初始化A和B
-            A = U_r  # [out_features, rank]
-            B = (S_r @ V_r)  # [rank, in_features]
+            sqrt_S = torch.sqrt(S_r)  # [rank, rank] 对角矩阵
+            A = U_r @ sqrt_S  # [out_features, rank]
+            B = sqrt_S @ V_r  # [rank, in_features]
 
             self.A = nn.Parameter(A.contiguous())
             self.B = nn.Parameter(B.contiguous())
@@ -1929,16 +1927,12 @@ def calculate_GRC(global_model, client_lora_models, client_losses, initial_lora_
         client_losses: 客户端损失列表
         initial_lora_params: 训练前的LoRA参数字典 {name: param_tensor}
     """
-    # 计算参数差异（先计算AB乘积，再计算差异）
     param_diffs = []
 
     for trained_lora_model in client_lora_models:
-        # 如果提供了初始参数，则计算与初始参数的差异
         if initial_lora_params is not None:
-            # 收集差异向量
             diff_vectors = []
 
-            # 获取模型中所有的LoRA层
             lora_layers = {
                 'lora_fc1': trained_lora_model.lora_fc1,
                 'lora_fc2': trained_lora_model.lora_fc2,
@@ -1946,10 +1940,7 @@ def calculate_GRC(global_model, client_lora_models, client_losses, initial_lora_
             }
 
             for layer_name, lora_layer in lora_layers.items():
-                # 计算当前训练后的AB乘积
                 current_AB = lora_layer.A @ lora_layer.B  # [in_features, out_features]
-
-                # 构建训练前的AB乘积
                 A_name = f"{layer_name}.A"
                 B_name = f"{layer_name}.B"
 
