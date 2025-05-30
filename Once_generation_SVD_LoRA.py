@@ -33,22 +33,31 @@ class MLPModel(nn.Module):
 
 
 class LoRALayer(nn.Module):
-    def __init__(self, A=None, B=None, alpha=1, rank=4):
+    def __init__(self, A=None, B=None, alpha=None, rank=None, bias=None):
         super().__init__()
         self.rank = rank
         self.alpha = alpha
         self.scaling = alpha / rank
         self.A = nn.Parameter(A.clone())
         self.B = nn.Parameter(B.clone())
+        # self.relu = nn.ReLU()
+        # if bias is not None:
+        #     self.bias = nn.Parameter(bias.clone())  
+        # else:
+        #     self.bias = None
 
     def forward(self, x):
+        # out = x @ (self.A @ self.B) * self.scaling
+        # if self.bias is not None:
+        #     out = out + self.bias
+        # return out
         return x @ (self.A @ self.B) * self.scaling # [in, rank] @ [rank, out]
 
 
 
 # 定义带 LoRA 的 MLP 模型
 class LoRAMLPModel(nn.Module):
-    def __init__(self, base_model, rank=4, alpha=1, lora_AB_dict=None):
+    def __init__(self, base_model, rank=70, alpha=1, lora_AB_dict=None):
         super(LoRAMLPModel, self).__init__()
         self.base_model = base_model
         
@@ -63,6 +72,16 @@ class LoRAMLPModel(nn.Module):
         self.lora_fc2 = LoRALayer(A2, B2, alpha=alpha, rank=rank)
         self.lora_fc3 = LoRALayer(A3, B3, alpha=alpha, rank=rank)
 
+        # bias_1 = base_model.fc1.bias.data.clone()
+        # bias_2 = base_model.fc2.bias.data.clone()
+        # bias_3 = base_model.fc3.bias.data.clone()
+
+        # self.lora_fc1 = LoRALayer(A1, B1, alpha=alpha, rank=rank, bias=bias_1)
+        # self.lora_fc2 = LoRALayer(A2, B2, alpha=alpha, rank=rank, bias=bias_2)
+        # self.lora_fc3 = LoRALayer(A3, B3, alpha=alpha, rank=rank, bias=bias_3)
+        # self.fc3_2 = nn.Linear(200, 10)
+
+
     def forward(self, x):
         x = x.view(x.size(0), -1)  # 展平输入
 
@@ -70,6 +89,11 @@ class LoRAMLPModel(nn.Module):
         fc1_out = self.base_model.relu(self.base_model.fc1(x) + self.lora_fc1(x))
         fc2_out = self.base_model.relu(self.base_model.fc2(fc1_out) + self.lora_fc2(fc1_out))
         out = self.base_model.fc3(fc2_out) + self.lora_fc3(fc2_out)
+
+        # # 前向传播结合基础模型和 LoRA 部分
+        # fc1_out = self.lora_fc1.relu(self.lora_fc1(x))
+        # fc2_out = self.lora_fc2.relu(self.lora_fc2(fc1_out))
+        # out = self.fc3_2(fc2_out)
 
         return out
 
@@ -337,7 +361,7 @@ def select_clients(client_loaders, use_all_clients=False, num_select=None,
         for client_id, client_loader in client_loaders.items():
             # 使用LoRA训练 - 减少训练成本
             trained_lora_model, h_i = local_train_fedgra_loss_lora(
-                global_model, client_loader, epochs=2, lr=0.01, rank=lora_rank, alpha=lora_alpha, lora_AB_dict=lora_AB_dict
+                global_model, client_loader, epochs=5, lr=0.01, rank=lora_rank, alpha=lora_alpha, lora_AB_dict=lora_AB_dict
             )
             client_lora_models.append(trained_lora_model)
             client_losses.append(h_i)
@@ -441,7 +465,7 @@ def main():
     global_model = MLPModel()
     global_accuracies = []  # 记录每轮全局模型的测试集准确率
     total_communication_counts = []  # 记录每轮客户端通信次数
-    rounds = 300 # 联邦学习轮数
+    rounds = 500 # 联邦学习轮数
     use_all_clients = False  # 是否进行客户端选择
     num_selected_clients = 2  # 每轮选择客户端训练数量
     use_loss_based_selection = False  # 是否根据 loss 选择客户端
