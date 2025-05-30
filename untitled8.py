@@ -359,13 +359,6 @@ def compute_model_flops(
 
     return total_training_flops
 
-def apply_structured_pruning(model, amount=0.3):
-    for name, module in model.named_modules():
-        if isinstance(module, nn.Linear):
-            torch.nn.utils.prune.ln_structured(module, name='weight', amount=amount, n=2, dim=0)
-            torch.nn.utils.prune.remove(module, 'weight')  # 🔥 移除掩码，实际修改模型结构
-    return model
-
 def structured_prune_layer(model, layer_name='fc2', prune_ratio=0.5, criterion='l1'):
     """
     通用结构化剪枝函数：对 fc1, fc2, fc3 中任意层按比例剪枝，并自动修改相应上下游层结构。
@@ -426,6 +419,33 @@ def apply_unstructured_pruning(model, amount=0.3):
             prune.l1_unstructured(module, name='weight', amount=amount)
     return model
 
+def apply_brute_pruning(model, layer_name: str, reconnect_from: str = 'fc1', reconnect_to: str = 'fc3'):
+    """
+    通用暴力剪枝函数：删除指定层，并选择性地重建连接。
+    """
+    if not hasattr(model, layer_name):
+        raise AttributeError(f"模型中不存在名为 '{layer_name}' 的层")
+
+    setattr(model, layer_name, nn.Identity())
+
+    if reconnect_from and reconnect_to:
+        if not hasattr(model, reconnect_from) or not hasattr(model, reconnect_to):
+            raise AttributeError(f"模型中不存在重连层 '{reconnect_from}' 或 '{reconnect_to}'")
+
+        from_layer = getattr(model, reconnect_from)
+        to_layer = getattr(model, reconnect_to)
+
+        if not isinstance(from_layer, nn.Linear) or not isinstance(to_layer, nn.Linear):
+            raise TypeError("重连层必须是 nn.Linear 类型")
+
+        new_input_dim = from_layer.out_features
+        new_output_dim = to_layer.out_features
+        new_layer = nn.Linear(new_input_dim, new_output_dim)
+        setattr(model, reconnect_to, new_layer)
+
+    return model
+
+
 def apply_freezing(model):
     for name, param in model.named_parameters():
         if 'weight' in name or 'bias' in name:
@@ -449,7 +469,7 @@ def apply_partial_freezing(model, freeze_layers=1):
 # 客户端选择器
 def select_clients(client_loaders, use_all_clients=False, num_select=None,
                    select_by_loss=False, global_model=None, grc=False,
-                   fairness_tracker=None, prune=False, prune_amount=0.3, freeze=False, freeze_layers = 1,):
+                   fairness_tracker=None, prune=False, prune_amount=0.3, freeze=False, freeze_layers = 1, brute_prune= False):
     total_flops = 0
     epochs = 1
     if grc:  # 使用 GRC 选择客户端
@@ -463,6 +483,8 @@ def select_clients(client_loaders, use_all_clients=False, num_select=None,
                 local_model = structured_prune_layer(local_model, prune_ratio=prune_amount)
             if freeze:
                 local_model = apply_partial_freezing(local_model, freeze_layers=freeze_layers)
+            if brute_prune:
+                local_model = apply_brute_pruning(local_model, layer_name='fc2')
 
             # 每轮都重新估计一次 FLOPs（避免模型变结构时不更新）
             sample_flops = compute_model_flops(local_model, input_shape=(1, 1, 28, 28), prune = prune ,freeze = freeze)
@@ -939,7 +961,7 @@ def save_metric(save_dir, results_labels, experiment_reuslts):
     df.to_csv(f"{save_dir}/{results_labels}.csv", index=False)
 
 def run_experiment(rounds, client_loaders, test_loader, client_data_sizes,
-                   freeze=False, freeze_layers = 1, prune=False, prune_amount = 0.3,
+                   freeze = False, freeze_layers = 1, prune = False, prune_amount = 0.3, brute_prune = False,
                    select_by_loss = False, grc = False, label="",):
     global_model = MLPModel()
     global_accuracies = []
@@ -972,7 +994,7 @@ def run_experiment(rounds, client_loaders, test_loader, client_data_sizes,
         selected_clients, round_flops = select_clients(
             client_loaders, use_all_clients=False, num_select=2,
             select_by_loss=select_by_loss, global_model=global_model,grc=grc,
-            prune=prune, prune_amount = prune_amount, freeze=freeze, freeze_layers=freeze_layers
+            prune=prune, prune_amount = prune_amount, freeze=freeze, freeze_layers=freeze_layers, brute_prune = brute_prune
         )
         print(f"Selected Clients: {selected_clients}")
 
@@ -1070,9 +1092,6 @@ def main4():
     use_all_clients = False  # 是否进行客户端选择
     num_selected_clients = 2  # 每轮选择客户端训练数量
     t_flops = 0
-    grc = False
-    prune = True
-    freeze = False
 
 
     # acc_loss, comm_loss, flops_loss, model_size_loss, inference_time_loss = run_experiment(rounds, client_loaders, test_loader, client_data_sizes,
@@ -1106,6 +1125,9 @@ def main4():
     acc_grc_prune_60, comm_grc_prune_60, flops_grc_prune_60, time_rounds_grc_prune_60, time_grc_prune_60 = run_experiment(
         rounds, client_loaders, test_loader, client_data_sizes,
         freeze=False, prune=True, prune_amount =0.6,select_by_loss=False, grc = True, label="GRA + Prune 0.6")
+    acc_grc_brute_prune, comm_grc_brute_prune, flops_grc_brute_prune, time_rounds_brute_prune, time_grc_brute_prune = run_experiment(
+        rounds, client_loaders, test_loader, client_data_sizes,
+        freeze=False, prune=False, brute_prune = True ,select_by_loss=False, grc = True, label="GRA + Brute Prune")
 
     # ① 准备 rolling average
     acc_grc_smooth = pd.Series(acc_grc).rolling(window=10, min_periods=1).mean()
@@ -1113,6 +1135,7 @@ def main4():
     acc_grc_freeze_2_smooth = pd.Series(acc_grc_freeze_2).rolling(window=10, min_periods=1).mean()
     acc_grc_prune_30_smooth = pd.Series(acc_grc_prune_30).rolling(window=10, min_periods=1).mean()
     acc_grc_prune_60_smooth = pd.Series(acc_grc_prune_60).rolling(window=10, min_periods=1).mean()
+    acc_grc_brute_prune_smooth = pd.Series(acc_grc_brute_prune).rolling(window=10, min_periods=1).mean()
 
     save_dir = "federated_results"
     os.makedirs(save_dir, exist_ok=True)
@@ -1148,6 +1171,11 @@ def main4():
         "flops_grc_prune_60": flops_grc_prune_60,
         "time_rounds_grc_prune_60": time_rounds_grc_prune_60,
         "time_grc_prune_60": time_grc_prune_60,
+        "acc_grc_brute_prune": acc_grc_brute_prune,
+        "comm_grc_brute_prune": comm_grc_brute_prune,
+        "flops_grc_brute_prune": flops_grc_brute_prune,
+        "time_rounds_brute_prune": time_rounds_brute_prune,
+        "time_grc_brute_prune": time_grc_brute_prune,
     }
 
 
@@ -1194,6 +1222,7 @@ def main4():
         "GRA + Freeze 2 Layers",
         "GRA + Prune 30%",
         "GRA + Prune 60%",
+        "Gra + Brute Prune",
     ]
 
     flops_values_grc = [
@@ -1202,6 +1231,7 @@ def main4():
         flops_grc_freeze_2,
         flops_grc_prune_30,
         flops_grc_prune_60,
+        flops_grc_brute_prune,
     ]
 
     time_values_rounds_grc = [
@@ -1210,14 +1240,16 @@ def main4():
         sum(time_rounds_grc_freeze_2),
         sum(time_rounds_grc_prune_30),
         sum(time_rounds_grc_prune_60),
+        sum(time_rounds_brute_prune),
     ]
 
     time_values_grc = [
-        sum(time_grc),
-        sum(time_grc_freeze_1),
-        sum(time_grc_freeze_2),
-        sum(time_grc_prune_30),
-        sum(time_grc_prune_60),
+        time_grc[-1],
+        time_grc_freeze_1[-1],
+        time_grc_freeze_2[-1],
+        time_grc_prune_30[-1],
+        time_grc_prune_60[-1],
+        time_grc_brute_prune[-1],
     ]
 
     fig, axes = plt.subplots(1, 3, figsize=(18, 6))
@@ -1255,7 +1287,7 @@ def main4():
     plt.tight_layout()
     plt.show()
 
-    fig, axes = plt.subplots(3, 2, figsize=(12, 16))
+    fig, axes = plt.subplots(4, 2, figsize=(12, 16))
 
     # ① Loss-based Accuracy Over Rounds
     # axes[0, 0].plot(acc_loss, label="Loss Only", marker='o')
@@ -1275,6 +1307,7 @@ def main4():
     axes[0, 0].plot(acc_grc_freeze_2, label="GRA + Freeze 2 Layers", marker='v')
     axes[0, 0].plot(acc_grc_prune_30, label="GRA + Prune 30%", marker='s')
     axes[0, 0].plot(acc_grc_prune_60, label="GRA + Prune 60%", marker='D')
+    axes[0, 0].plot(acc_grc_brute_prune, label="GRA + Brute Prune", marker='*')
     axes[0, 0].set_title("Accuracy Over Rounds (GRA)")
     axes[0, 0].set_xlabel("Rounds")
     axes[0, 0].set_ylabel("Accuracy (%)")
@@ -1305,11 +1338,11 @@ def main4():
     axes[0, 1].legend()
     axes[0, 1].grid(True)
 
-    axes[1, 0].plot(acc_grc, label="GRA Only", marker='o')
-    axes[1, 0].plot(acc_grc_smooth, label="GRA Only (Smoothed)", linestyle='--')
+    axes[1, 0].plot(acc_grc, label="GRA Only", linestyle='--' ,alpha=0.6)
+    axes[1, 0].plot(acc_grc_smooth, label="GRA Only (Smoothed)")
     axes[1, 0].fill_between(range(len(acc_grc_smooth)), acc_grc_smooth, color='blue', alpha=0.2)
-    axes[1, 0].plot(acc_grc_freeze_1, label="GRA + Freeze 1 Layer", marker='^')
-    axes[1, 0].plot(acc_grc_freeze_1_smooth, label="GRA + Freeze 1 Layer (Smoothed)", linestyle='--')
+    axes[1, 0].plot(acc_grc_freeze_1, label="GRA + Freeze 1 Layer", linestyle='--' ,alpha=0.6)
+    axes[1, 0].plot(acc_grc_freeze_1_smooth, label="GRA + Freeze 1 Layer (Smoothed)")
     axes[1, 0].fill_between(range(len(acc_grc_freeze_1_smooth)), acc_grc_freeze_1_smooth, color='orange', alpha=0.2)
     axes[1, 0].set_title("Accuracy Over Rounds (GRA)")
     axes[1, 0].set_xlabel("Rounds")
@@ -1317,11 +1350,11 @@ def main4():
     axes[1, 0].legend()
     axes[1, 0].grid(True)
 
-    axes[1, 1].plot(acc_grc, label="GRA Only", marker='o')
-    axes[1, 1].plot(acc_grc_smooth, label="GRA Only (Smoothed)", linestyle='--')
+    axes[1, 1].plot(acc_grc, label="GRA Only", linestyle='--' ,alpha=0.6)
+    axes[1, 1].plot(acc_grc_smooth, label="GRA Only (Smoothed)")
     axes[1, 1].fill_between(range(len(acc_grc_smooth)), acc_grc_smooth, color='blue', alpha=0.2)
-    axes[1, 1].plot(acc_grc_prune_30, label="GRA + Prune 30%", marker='s')
-    axes[1, 1].plot(acc_grc_prune_30_smooth, label="GRA + Prune 30% (Smoothed)", linestyle='--')
+    axes[1, 1].plot(acc_grc_prune_30, label="GRA + Prune 30%", linestyle='--' ,alpha=0.6)
+    axes[1, 1].plot(acc_grc_prune_30_smooth, label="GRA + Prune 30% (Smoothed)")
     axes[1, 1].fill_between(range(len(acc_grc_prune_30_smooth)), acc_grc_prune_30_smooth, color='red', alpha=0.2)
     axes[1, 1].set_title("Accuracy Over Rounds (GRA)")
     axes[1, 1].set_xlabel("Rounds")
@@ -1329,11 +1362,11 @@ def main4():
     axes[1, 1].legend()
     axes[1, 1].grid(True)
 
-    axes[2, 0].plot(acc_grc_freeze_1, label="GRA + Freeze 1 Layer", marker='^')
-    axes[2, 0].plot(acc_grc_freeze_1_smooth, label="GRA + Freeze 1 Layer (Smoothed)", linestyle='--')
+    axes[2, 0].plot(acc_grc_freeze_1, label="GRA + Freeze 1 Layer", linestyle='--' ,alpha=0.6)
+    axes[2, 0].plot(acc_grc_freeze_1_smooth, label="GRA + Freeze 1 Layer (Smoothed)")
     axes[2, 0].fill_between(range(len(acc_grc_freeze_1_smooth)), acc_grc_freeze_1_smooth, color='orange', alpha=0.2)
-    axes[2, 0].plot(acc_grc_freeze_2, label="GRA + Freeze 2 Layers", marker='v')
-    axes[2, 0].plot(acc_grc_freeze_2_smooth, label="GRA + Freeze 2 Layer (Smoothed)", linestyle='--')
+    axes[2, 0].plot(acc_grc_freeze_2, label="GRA + Freeze 2 Layers", linestyle='--' ,alpha=0.6)
+    axes[2, 0].plot(acc_grc_freeze_2_smooth, label="GRA + Freeze 2 Layer (Smoothed)")
     axes[2, 0].fill_between(range(len(acc_grc_freeze_2_smooth)), acc_grc_freeze_2_smooth, color='green', alpha=0.2)
     axes[2, 0].set_title("Accuracy Over Rounds (GRA)")
     axes[2, 0].set_xlabel("Rounds")
@@ -1341,17 +1374,43 @@ def main4():
     axes[2, 0].legend()
     axes[2, 0].grid(True)
 
-    axes[2, 1].plot(acc_grc_prune_30, label="GRA + Prune 30%", marker='s')
-    axes[2, 1].plot(acc_grc_prune_30_smooth, label="GRA + Prune 30% (Smoothed)", linestyle='--')
+    axes[2, 1].plot(acc_grc_prune_30, label="GRA + Prune 30%", linestyle='--' ,alpha=0.6)
+    axes[2, 1].plot(acc_grc_prune_30_smooth, label="GRA + Prune 30% (Smoothed)")
     axes[2, 1].fill_between(range(len(acc_grc_prune_30_smooth)), acc_grc_prune_30_smooth, color='red', alpha=0.2)
-    axes[2, 1].plot(acc_grc_prune_60, label="GRA + Prune 60%", marker='D')
-    axes[2, 1].plot(acc_grc_prune_60_smooth, label="GRA + Prune 60% (Smoothed)", linestyle='--')
+    axes[2, 1].plot(acc_grc_prune_60, label="GRA + Prune 60%", linestyle='--' ,alpha=0.6)
+    axes[2, 1].plot(acc_grc_prune_60_smooth, label="GRA + Prune 60% (Smoothed)")
     axes[2, 1].fill_between(range(len(acc_grc_prune_60_smooth)), acc_grc_prune_60_smooth, color='purple', alpha=0.2)
     axes[2, 1].set_title("Accuracy Over Rounds (GRA)")
     axes[2, 1].set_xlabel("Rounds")
     axes[2, 1].set_ylabel("Accuracy (%)")
     axes[2, 1].legend()
     axes[2, 1].grid(True)
+
+
+    axes[3, 0].plot(acc_grc, label="GRA Only", linestyle='--' ,alpha=0.6)
+    axes[3, 0].plot(acc_grc_smooth, label="GRA Only (Smoothed)")
+    axes[3, 0].fill_between(range(len(acc_grc_smooth)), acc_grc_smooth, color='blue', alpha=0.2)
+    axes[3, 0].plot(acc_grc_brute_prune, label="GRA + Brute Prune", linestyle='--' ,alpha=0.6)
+    axes[3, 0].plot(acc_grc_brute_prune_smooth, label="GRA + Brute Prune (Smoothed)")
+    axes[3, 0].fill_between(range(len(acc_grc_brute_prune_smooth)), acc_grc_brute_prune_smooth, color='yellow', alpha=0.2)
+    axes[3, 0].set_title("Accuracy Over Rounds (GRA)")
+    axes[3, 0].set_xlabel("Rounds")
+    axes[3, 0].set_ylabel("Accuracy (%)")
+    axes[3, 0].legend()
+    axes[3, 0].grid(True)
+
+    axes[3, 1].plot(acc_grc_brute_prune, label="GRA + Brute Prune", linestyle='--' ,alpha=0.6)
+    axes[3, 1].plot(acc_grc_brute_prune_smooth, label="GRA + Brute Prune (Smoothed)")
+    axes[3, 1].fill_between(range(len(acc_grc_brute_prune_smooth)), acc_grc_brute_prune_smooth, color='yellow', alpha=0.2)
+    axes[3, 1].plot(acc_grc_prune_60, label="GRA + Prune 60%", linestyle='--' ,alpha=0.6)
+    axes[3, 1].plot(acc_grc_prune_60_smooth, label="GRA + Prune 60% (Smoothed)")
+    axes[3, 1].fill_between(range(len(acc_grc_prune_60_smooth)), acc_grc_prune_60_smooth, color='purple', alpha=0.2)
+    axes[3, 1].set_title("Accuracy Over Rounds (GRA)")
+    axes[3, 1].set_xlabel("Rounds")
+    axes[3, 1].set_ylabel("Accuracy (%)")
+    axes[3, 1].legend()
+    axes[3, 1].grid(True)
+    
 
     plt.tight_layout()
     plt.show()
@@ -1428,5 +1487,398 @@ def main4():
     plt.show()
 
 
+
+def run_experiment_time(total_times, client_loaders, test_loader, client_data_sizes,
+                   freeze=False, freeze_layers = 1, prune=False, prune_amount = 0.3,
+                   select_by_loss = False, grc = False, label="",):
+    global_model = MLPModel()
+    global_accuracies = []
+    total_communication_counts = []
+    total_tflops = 0
+    used_times = []
+    time_count = 0
+    rounds = 0
+
+
+    # 初始化通信计数器
+    communication_counts = {}
+    for client_id in client_loaders.keys():
+        communication_counts[client_id] = {
+            'send': 0,
+            'receive': 0,
+            'full_round': 0
+        }
+
+    # 实验数据存储 CSV
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    csv_filename = f"training_data_{timestamp}.csv"
+    csv_data = []
+
+    start_time = time.time()
+
+    while time_count < total_times:
+        print(f"\n🔁 [{label}] Round {rounds + 1}")
+
+
+        selected_clients, round_flops = select_clients(
+            client_loaders, use_all_clients=False, num_select=2,
+            select_by_loss=select_by_loss, global_model=global_model,grc=grc,
+            prune=prune, prune_amount = prune_amount, freeze=freeze, freeze_layers=freeze_layers
+        )
+        print(f"Selected Clients: {selected_clients}")
+        update_communication_counts(communication_counts, selected_clients, "receive")
+        total_tflops += round_flops / 1e12
+
+        client_state_dicts = []
+
+        # 客户端本地训练
+        for client_id in selected_clients:
+            client_loader = client_loaders[client_id]
+            local_model = MLPModel()
+            local_model.load_state_dict(global_model.state_dict())  # 复制全局模型参数
+            local_state = local_train(local_model, client_loader, epochs=5, lr=0.01)  # 训练 1 轮
+            client_state_dicts.append((client_id, local_state))  # 存储 (客户端ID, 训练后的参数)
+
+            update_communication_counts(communication_counts, [client_id], "send")  # 记录客户端上报通信次数
+
+            param_mean = {name: param.mean().item() for name, param in local_model.named_parameters()}
+            print(f"  ✅ 客户端 {client_id} 训练完成 | 样本数量: {sum(client_data_sizes[client_id].values())}")
+            print(f"  📌 客户端 {client_id} 模型参数均值: {param_mean}")
+
+        # 计算本轮通信次数
+        total_send = sum(communication_counts[c]['send'] - (communication_counts[c]['full_round'] - 1) for c in selected_clients)
+        total_receive = sum(communication_counts[c]['receive'] - (communication_counts[c]['full_round'] - 1) for c in selected_clients)
+        total_comm = total_send + total_receive  # 每轮独立的总通信次数
+
+        # 如果不是第一轮，累加前一轮的通信次数
+        if len(total_communication_counts) > 0:
+            total_comm += total_communication_counts[-1]
+        total_communication_counts.append(total_comm)
+
+        # 聚合
+        global_model = fed_avg(global_model, client_state_dicts, client_data_sizes)
+        loss, accuracy = evaluate(global_model, test_loader)
+        global_accuracies.append(accuracy)
+
+        # 输出最终模型的性能
+        final_loss, final_accuracy = evaluate(global_model, test_loader)
+        print(f"🎯 Final model test set accuracy: {final_accuracy:.2f}%")
+
+        rounds += 1
+
+        end_time = time.time()
+        time_count = end_time - start_time
+        used_times.append(time_count)
+
+
+        # 输出通信记录
+        print("\n Client Communication Statistics:")
+        for client_id, counts in communication_counts.items():
+            print(f"Client {client_id}: Sent {counts['send']} times, Received {counts['receive']} times, Completed full_round {counts['full_round']} times")
+        # 记录数据到 CSV
+        if grc and hasattr(select_clients, 'latest_weights'):
+            w_loss = select_clients.latest_weights[0]
+            w_diff = select_clients.latest_weights[1]
+            print(f"📈 Round {rounds + 1} | GRC 权重: w_loss = {w_loss:.4f}, w_diff = {w_diff:.4f}")
+
+        else:
+            w_loss = 'NA'
+            w_diff = 'NA'
+
+        csv_data.append([
+            rounds + 1,
+            accuracy,
+            total_comm,
+            ",".join(map(str, selected_clients)),
+            w_loss,
+            w_diff
+        ])
+        df = pd.DataFrame(csv_data, columns=[
+            'Round', 'Accuracy', 'Total communication counts', 'Selected Clients',
+            'GRC Weight - Loss', 'GRC Weight - Diff'])
+        df.to_csv(csv_filename, index=False)
+
+    return global_accuracies, total_communication_counts ,total_tflops * rounds, rounds, used_times
+
+def main5():
+    torch.manual_seed(0)
+    random.seed(0)
+    np.random.seed(0)
+
+    # 加载 MNIST 数据集
+    train_data, test_data = load_mnist_data()
+
+    # 生成客户端数据集，每个客户端包含多个类别
+    client_datasets, client_data_sizes = split_data_by_label(train_data)
+
+    # 创建数据加载器
+    client_loaders = {client_id: data.DataLoader(dataset, batch_size=32, shuffle=True)
+                      for client_id, dataset in client_datasets.items()}
+    test_loader = data.DataLoader(test_data, batch_size=32, shuffle=False)
+
+    # 初始化全局模型
+    total_times = 1800  # 联邦学习轮数
+    use_all_clients = False  # 是否进行客户端选择
+    num_selected_clients = 2  # 每轮选择客户端训练数量
+    t_flops = 0
+
+    acc_grc, comm_grc, flops_grc, rounds_grc, time_grc = run_experiment_time(
+        total_times, client_loaders, test_loader, client_data_sizes,
+        freeze=False, prune=False,select_by_loss=False, grc = True, label="GRA Only")
+    acc_grc_freeze_1, comm_grc_freeze_1, flops_grc_freeze_1,rounds_grc_freeze_1, time_grc_freeze_1 = run_experiment_time(
+        total_times, client_loaders, test_loader, client_data_sizes,
+        freeze=True, prune=False,select_by_loss=False, grc = True, label="GRA + Freeze 1 Layer")
+    acc_grc_freeze_2, comm_grc_freeze_2, flops_grc_freeze_2, rounds_grc_freeze_2, time_grc_freeze_2= run_experiment_time(
+        total_times, client_loaders, test_loader, client_data_sizes,
+        freeze=True, freeze_layers = 2, prune=False,select_by_loss=False, grc = True, label="GRA + Freeze 2 Layers")
+    acc_grc_prune_30, comm_grc_prune_30, flops_grc_prune_30, rounds_grc_prune_30, time_grc_prune_30 = run_experiment_time(
+        total_times, client_loaders, test_loader, client_data_sizes,
+        freeze=False, prune=True, prune_amount =0.3,select_by_loss=False, grc = True, label="GRA + Prune 0.3")
+    acc_grc_prune_60, comm_grc_prune_60, flops_grc_prune_60,rounds_grc_prune_60, time_grc_prune_60 = run_experiment_time(
+        total_times, client_loaders, test_loader, client_data_sizes,
+        freeze=False, prune=True, prune_amount =0.6,select_by_loss=False, grc = True, label="GRA + Prune 0.6")
+
+    # ① 准备 rolling average
+    acc_grc_smooth = pd.Series(acc_grc).rolling(window=10, min_periods=1).mean()
+    acc_grc_freeze_1_smooth = pd.Series(acc_grc_freeze_1).rolling(window=10, min_periods=1).mean()
+    acc_grc_freeze_2_smooth = pd.Series(acc_grc_freeze_2).rolling(window=10, min_periods=1).mean()
+    acc_grc_prune_30_smooth = pd.Series(acc_grc_prune_30).rolling(window=10, min_periods=1).mean()
+    acc_grc_prune_60_smooth = pd.Series(acc_grc_prune_60).rolling(window=10, min_periods=1).mean()
+
+    save_dir = "federated_results_time"
+    os.makedirs(save_dir, exist_ok=True)
+
+    metrics_to_save = {
+        "acc_grc": acc_grc,
+        "acc_grc_smooth": acc_grc_smooth,
+        "comm_grc": comm_grc,
+        "flops_grc": flops_grc,
+        "rounds_grc": rounds_grc,
+        "time_grc": time_grc,
+        "acc_grc_freeze_1": acc_grc_freeze_1,
+        "acc_grc_freeze_1_smooth": acc_grc_freeze_1_smooth,
+        "comm_grc_freeze_1": comm_grc_freeze_1,
+        "flops_grc_freeze_1": flops_grc_freeze_1,
+        "rounds_grc_freeze_1": rounds_grc_freeze_1,
+        "time_grc_freeze_1": time_grc_freeze_1,
+        "acc_grc_freeze_2": acc_grc_freeze_2,
+        "acc_grc_freeze_2_smooth": acc_grc_freeze_2_smooth,
+        "comm_grc_freeze_2": comm_grc_freeze_2,
+        "flops_grc_freeze_2": flops_grc_freeze_2,
+        "rounds_grc_freeze_2": rounds_grc_freeze_2,
+        "time_grc_freeze_2": time_grc_freeze_2,
+        "acc_grc_prune_30": acc_grc_prune_30,
+        "acc_grc_prune_30_smooth": acc_grc_prune_30_smooth,
+        "comm_grc_prune_30": comm_grc_prune_30,
+        "flops_grc_prune_30": flops_grc_prune_30,
+        "rounds_grc_prune_30": rounds_grc_prune_30,
+        "time_grc_prune_30": time_grc_prune_30,
+        "acc_grc_prune_60": acc_grc_prune_60,
+        "acc_grc_prune_60_smooth": acc_grc_prune_60_smooth,
+        "comm_grc_prune_60": comm_grc_prune_60,
+        "flops_grc_prune_60": flops_grc_prune_60,
+        "rounds_grc_prune_60": rounds_grc_prune_60,
+        "time_grc_prune_60": time_grc_prune_60,
+    }
+
+
+    for results_labels, experiment_reuslts in metrics_to_save.items():
+        save_metric(save_dir, results_labels, experiment_reuslts)
+
+
+    labels_grc = [
+        "GRA Only",
+        "GRA + Freeze 1 Layer",
+        "GRA + Freeze 2 Layers",
+        "GRA + Prune 30%",
+        "GRA + Prune 60%",
+    ]
+
+    flops_values_grc = [
+        flops_grc,
+        flops_grc_freeze_1,
+        flops_grc_freeze_2,
+        flops_grc_prune_30,
+        flops_grc_prune_60,
+    ]
+
+    round_counts_grc = [
+        rounds_grc,
+        rounds_grc_freeze_1,
+        rounds_grc_freeze_2,
+        rounds_grc_prune_30,
+        rounds_grc_prune_60,
+    ]
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 6))
+    bar_colors = ['skyblue', 'lightgreen','orange']
+    metrics = ['FLOPs (TFLOPs)', 'Round']
+    titles = ['FLOPs Comparison', 'Rounds Comparison']
+    # GRC-based
+    grc_values = [flops_values_grc,round_counts_grc]
+
+    # 绘制 GRC-based (下排)
+    for i in range(2):
+        bars = axes[i].bar(labels_grc, grc_values[i], color=bar_colors[i])
+        for bar in bars:
+            height = bar.get_height()
+            axes[i].text(bar.get_x() + bar.get_width()/2.0, height, f"{height:.4f}", ha='center', va='bottom')
+        axes[i].set_title(titles[i] + " (GRA-based)")
+        axes[i].set_ylabel(metrics[i])
+        axes[i].tick_params(axis='x', rotation=20)
+        axes[i].grid(axis='y', linestyle='--', alpha=0.7)
+
+    plt.tight_layout()
+    plt.show()
+
+    fig, axes = plt.subplots(3, 2, figsize=(12, 16))
+
+    # ② GRC-based Accuracy Over Times
+    axes[0, 0].plot(time_grc,acc_grc, label="GRA Only", marker='o')
+    axes[0, 0].plot(time_grc_freeze_1, acc_grc_freeze_1, label="GRA + Freeze 1 Layer", marker='^')
+    axes[0, 0].plot(time_grc_freeze_2, acc_grc_freeze_2, label="GRA + Freeze 2 Layers", marker='v')
+    axes[0, 0].plot(time_grc_prune_30, acc_grc_prune_30, label="GRA + Prune 30%", marker='s')
+    axes[0, 0].plot(time_grc_prune_60, acc_grc_prune_60, label="GRA + Prune 60%", marker='D')
+    axes[0, 0].set_title("Accuracy Over Times (GRA)")
+    axes[0, 0].set_xlabel("Times")
+    axes[0, 0].set_ylabel("Accuracy (%)")
+    axes[0, 0].legend()
+    axes[0, 0].grid(True)
+
+    # ④ GRC-based Accuracy vs Communication
+    axes[0, 1].plot(comm_grc, acc_grc, label="GRA Only", marker='o')
+    axes[0, 1].plot(comm_grc_freeze_1, acc_grc_freeze_1, label="GRA + Freeze 1 Layer", marker='^')
+    axes[0, 1].plot(comm_grc_freeze_2, acc_grc_freeze_2, label="GRA + Freeze 2 Layers", marker='v')
+    axes[0, 1].plot(comm_grc_prune_30, acc_grc_prune_30, label="GRA + Prune 30%", marker='s')
+    axes[0, 1].plot(comm_grc_prune_60, acc_grc_prune_60, label="GRA + Prune 60%", marker='D')
+    axes[0, 1].set_title("Accuracy vs Communication (GRA)")
+    axes[0, 1].set_xlabel("Comm Count")
+    axes[0, 1].set_ylabel("Accuracy (%)")
+    axes[0, 1].legend()
+    axes[0, 1].grid(True)
+
+    axes[1, 0].plot(time_grc, acc_grc, label="GRA Only", marker='o')
+    axes[1, 0].plot(time_grc, acc_grc_smooth, label="GRA Only (Smoothed)", linestyle='--')
+    axes[1, 0].fill_between(time_grc, acc_grc_smooth, color='blue', alpha=0.2)
+    axes[1, 0].plot(time_grc_freeze_1, acc_grc_freeze_1, label="GRA + Freeze 1 Layer", marker='^')
+    axes[1, 0].plot(time_grc_freeze_1, acc_grc_freeze_1_smooth, label="GRA + Freeze 1 Layer (Smoothed)", linestyle='--')
+    axes[1, 0].fill_between(time_grc_freeze_1, acc_grc_freeze_1_smooth, color='orange', alpha=0.2)
+    axes[1, 0].set_title("Accuracy Over Times (GRA)")
+    axes[1, 0].set_xlabel("Times")
+    axes[1, 0].set_ylabel("Accuracy (%)")
+    axes[1, 0].legend()
+    axes[1, 0].grid(True)
+
+    axes[1, 1].plot(time_grc, acc_grc, label="GRA Only", marker='o')
+    axes[1, 1].plot(time_grc, acc_grc_smooth, label="GRA Only (Smoothed)", linestyle='--')
+    axes[1, 1].fill_between(time_grc, acc_grc_smooth, color='blue', alpha=0.2)
+    axes[1, 1].plot(time_grc_prune_30, acc_grc_prune_30, label="GRA + Prune 30%", marker='s')
+    axes[1, 1].plot(time_grc_prune_30, acc_grc_prune_30_smooth, label="GRA + Prune 30% (Smoothed)", linestyle='--')
+    axes[1, 1].fill_between(time_grc_prune_30, acc_grc_prune_30_smooth, color='red', alpha=0.2)
+    axes[1, 1].set_title("Accuracy Over Times (GRA)")
+    axes[1, 1].set_xlabel("Times")
+    axes[1, 1].set_ylabel("Accuracy (%)")
+    axes[1, 1].legend()
+    axes[1, 1].grid(True)
+
+    axes[2, 0].plot(time_grc_freeze_1, acc_grc_freeze_1, label="GRA + Freeze 1 Layer", marker='^')
+    axes[2, 0].plot(time_grc_freeze_1, acc_grc_freeze_1_smooth, label="GRA + Freeze 1 Layer (Smoothed)", linestyle='--')
+    axes[2, 0].fill_between(time_grc_freeze_1, acc_grc_freeze_1_smooth, color='orange', alpha=0.2)
+    axes[2, 0].plot(time_grc_freeze_2, acc_grc_freeze_2, label="GRA + Freeze 2 Layers", marker='v')
+    axes[2, 0].plot(time_grc_freeze_2, acc_grc_freeze_2_smooth, label="GRA + Freeze 2 Layer (Smoothed)", linestyle='--')
+    axes[2, 0].fill_between(time_grc_freeze_2, acc_grc_freeze_2_smooth, color='green', alpha=0.2)
+    axes[2, 0].set_title("Accuracy Over Times (GRA)")
+    axes[2, 0].set_xlabel("Times")
+    axes[2, 0].set_ylabel("Accuracy (%)")
+    axes[2, 0].legend()
+    axes[2, 0].grid(True)
+
+    axes[2, 1].plot(time_grc_prune_30, acc_grc_prune_30, label="GRA + Prune 30%", marker='s')
+    axes[2, 1].plot(time_grc_prune_30, acc_grc_prune_30_smooth, label="GRA + Prune 30% (Smoothed)", linestyle='--')
+    axes[2, 1].fill_between(time_grc_prune_30, acc_grc_prune_30_smooth, color='red', alpha=0.2)
+    axes[2, 1].plot(time_grc_prune_60, acc_grc_prune_60, label="GRA + Prune 60%", marker='D')
+    axes[2, 1].plot(time_grc_prune_60, acc_grc_prune_60_smooth, label="GRA + Prune 60% (Smoothed)", linestyle='--')
+    axes[2, 1].fill_between(time_grc_prune_60, acc_grc_prune_60_smooth, color='purple', alpha=0.2)
+    axes[2, 1].set_title("Accuracy Over Times (GRA)")
+    axes[2, 1].set_xlabel("Times")
+    axes[2, 1].set_ylabel("Accuracy (%)")
+    axes[2, 1].legend()
+    axes[2, 1].grid(True)
+
+    plt.tight_layout()
+    plt.show()
+
+    # 累积时间 + 加0点
+    time_total_1, acc_1 = prepend_zero(time_grc, acc_grc_smooth)
+    time_total_2, acc_2 = prepend_zero(time_grc_freeze_1, acc_grc_freeze_1_smooth)
+    time_total_3, acc_3 = prepend_zero(time_grc_freeze_2, acc_grc_freeze_2_smooth)
+    time_total_4, acc_4 = prepend_zero(time_grc_prune_30, acc_grc_prune_30_smooth)
+    time_total_5, acc_5 = prepend_zero(time_grc_prune_60, acc_grc_prune_60_smooth)
+
+    # time_round_1, _ = prepend_zero(time_rounds_grc, acc_grc_smooth)
+    # time_round_2, _ = prepend_zero(time_rounds_grc_freeze_1, acc_grc_freeze_1_smooth)
+    # time_round_3, _ = prepend_zero(time_rounds_grc_freeze_2, acc_grc_freeze_2_smooth)
+    # time_round_4, _ = prepend_zero(time_rounds_grc_prune_30, acc_grc_prune_30_smooth)
+    # time_round_5, _ = prepend_zero(time_rounds_grc_prune_60, acc_grc_prune_60_smooth)
+
+    fig, axes = plt.subplots(1, 1, figsize=(8, 6))
+
+    # 配色（可自定义）
+    colors = {
+        'GRA Only': 'tab:blue',
+        'Freeze 1': 'tab:orange',
+        'Freeze 2': 'tab:green',
+        'Prune 30': 'tab:red',
+        'Prune 60': 'tab:purple'
+    }
+
+    # 左图：Total Training Time
+    axes.plot(time_total_1, acc_1, marker='o', label='GRA Only', color=colors['GRA Only'])
+    axes.fill_between(time_total_1, acc_1, alpha=0.2, color=colors['GRA Only'])
+
+    axes.plot(time_total_2, acc_2, marker='^', label='GRA + Freeze 1 Layer', color=colors['Freeze 1'])
+    axes.fill_between(time_total_2, acc_2, alpha=0.2, color=colors['Freeze 1'])
+
+    axes.plot(time_total_3, acc_3, marker='s', label='GRA + Freeze 2 Layers', color=colors['Freeze 2'])
+    axes.fill_between(time_total_3, acc_3, alpha=0.2, color=colors['Freeze 2'])
+
+    axes.plot(time_total_4, acc_4, marker='D', label='GRA + Prune 30%', color=colors['Prune 30'])
+    axes.fill_between(time_total_4, acc_4, alpha=0.2, color=colors['Prune 30'])
+
+    axes.plot(time_total_5, acc_5, marker='v', label='GRA + Prune 60%', color=colors['Prune 60'])
+    axes.fill_between(time_total_5, acc_5, alpha=0.2, color=colors['Prune 60'])
+
+    axes.set_title("Accuracy vs Total Training Time")
+    axes.set_xlabel("Cumulative Total Time (s)")
+    axes.set_ylabel("Accuracy (%)")
+    axes.legend()
+    axes.grid(True)
+
+    # 右图：Round Execution Time
+    # axes[1].plot(time_round_1, acc_1, marker='o', label='GRA Only', color=colors['GRA Only'])
+    # axes[1].fill_between(time_round_1, acc_1, alpha=0.2, color=colors['GRA Only'])
+
+    # axes[1].plot(time_round_2, acc_2, marker='^', label='GRA + Freeze 1 Layer', color=colors['Freeze 1'])
+    # axes[1].fill_between(time_round_2, acc_2, alpha=0.2, color=colors['Freeze 1'])
+
+    # axes[1].plot(time_round_3, acc_3, marker='s', label='GRA + Freeze 2 Layers', color=colors['Freeze 2'])
+    # axes[1].fill_between(time_round_3, acc_3, alpha=0.2, color=colors['Freeze 2'])
+
+    # axes[1].plot(time_round_4, acc_4, marker='D', label='GRA + Prune 30%', color=colors['Prune 30'])
+    # axes[1].fill_between(time_round_4, acc_4, alpha=0.2, color=colors['Prune 30'])
+
+    # axes[1].plot(time_round_5, acc_5, marker='v', label='GRA + Prune 60%', color=colors['Prune 60'])
+    # axes[1].fill_between(time_round_5, acc_5, alpha=0.2, color=colors['Prune 60'])
+
+    # axes[1].set_title("Accuracy vs Round Execution Time")
+    # axes[1].set_xlabel("Cumulative Round Time (s)")
+    # axes[1].set_ylabel("Accuracy (%)")
+    # axes[1].legend()
+    # axes[1].grid(True)
+
+    plt.tight_layout()
+    plt.show()
+
+
 if __name__ == "__main__":
-    main4()
+    main5()
