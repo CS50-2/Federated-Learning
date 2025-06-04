@@ -1702,7 +1702,7 @@ class LoRALayer(nn.Module):
 
     def forward(self, x):
         AB = self.A @ self.B  # [in, rank] @ [rank, out]
-        output = AB @ x.T
+        output = AB.T @ x.T
         if self.base_bias is not None:
             output += self.base_bias.unsqueeze(1)
         return output.T
@@ -1710,7 +1710,7 @@ class LoRALayer(nn.Module):
 
 # 定义带 LoRA 的 MLP 模型
 class LoRAMLPModel(nn.Module):
-    def __init__(self, base_model, rank=4, alpha=1, use_svd=True, svd_cache=None):
+    def __init__(self, base_model, rank=4, alpha=1, use_svd=False, svd_cache=None):
         super(LoRAMLPModel, self).__init__()
         self.base_model = base_model
 
@@ -2068,8 +2068,8 @@ def select_clients(client_loaders, use_all_clients=False, num_select=None,
             client_lora_models.append(trained_lora_model)
             client_losses.append(h_i)
 
-            # Calculating parameters used in LoRA Model
-            param_count_this_round += count_lora_parameters(trained_lora_model) # adding up calculated parameters
+            # Calculating parameters used in Model
+            param_count_this_round += count_parameters(trained_lora_model) # adding up calculated parameters
 
             # Calculating forward FLOPs
             batch_size = 1
@@ -2130,14 +2130,19 @@ def update_communication_counts(communication_counts, selected_clients, event):
         if event == "send" and communication_counts[client_id]['receive'] > 0:
             communication_counts[client_id]['full_round'] += 1
 
-# calculating parameters used in LoRA model 
-def count_lora_parameters(model):
+# calculating parameters used in any model 
+def count_parameters(model):
     total = 0
-    for name, module in model.named_modules():
+    found_lora = False
+    for _, module in model.named_modules():
         if isinstance(module, LoRALayer):
+            found_lora = True
             total += module.A.numel()
             total += module.B.numel()
-    return total
+    if found_lora:
+        return total
+    else:
+        return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
 def main(lora_rank=None, lr=None):
@@ -2160,7 +2165,7 @@ def main(lora_rank=None, lr=None):
     global_model = MLPModel()
     global_accuracies = []  # 记录每轮全局模型的测试集准确率
     total_communication_counts = []  # 记录每轮客户端通信次数
-    rounds = 5  # 联邦学习轮数
+    rounds = 500  # 联邦学习轮数
     use_all_clients = False  # 是否进行客户端选择
     num_selected_clients = 2  # 每轮选择客户端训练数量
     use_loss_based_selection = False  # 是否根据 loss 选择客户端
@@ -2306,7 +2311,9 @@ def main(lora_rank=None, lr=None):
 
 
 if __name__ == "__main__":
+    # rank_list = [4, 8, 16, 32]
     # rank_list = [30, 60, 90, 120, 150, 180]
+    # rank_list = [4]
     # lr_list = [0.1, 0.01, 0.001]
     # T1 = time.time()
     # for lr in lr_list:
