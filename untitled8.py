@@ -319,7 +319,10 @@ def calculate_GRC(global_model, client_models, client_losses):
     return weighted_score, weights
 
 def compute_model_flops(
-    model, input_shape=(1, 1, 28, 28), batch_size=1, num_samples=1, epochs=1, backward=False, verbose=False ,freeze = False, prune = False
+    model, input_shape=(1, 1, 28, 28), batch_size=1,
+    num_samples=1, epochs=1, backward=True,
+    verbose=False, freeze=False, freeze_layers=1,
+    prune=False, prune_ratio=0.3, brute_prune=False
 ):
     """
     计算训练阶段的总 FLOPs（估算）
@@ -337,14 +340,26 @@ def compute_model_flops(
     flops_analyzer = FlopCountAnalysis(model, dummy_input)
 
     if backward:
-      if freeze:
-        backward_factor = 1.42
-      if prune:
-        backward_factor = 1.7
-      else:
-        backward_factor = 3
+        if freeze:
+            if freeze_layers == 1:
+                backward_factor = 1.9  # 冻结 fc1
+            elif freeze_layers >= 2:
+                backward_factor = 1.42  # 冻结 fc1 + fc2
+            else:
+                backward_factor = 3.0  # 理论不会到这里
+        elif prune:
+            if prune_ratio >= 0.6:
+                backward_factor = 1.6
+            elif prune_ratio >= 0.3:
+                backward_factor = 1.7
+            else:
+                backward_factor = 1.8  # 轻微剪枝
+        elif brute_prune:
+            backward_factor = 1.5  # 暴力剪掉一层并重连
+        else:
+            backward_factor = 3.0  # 全部参数参与训练
     else:
-      backward_factor = 0
+        backward_factor = 0.0  # 不考虑反向传播
 
     if verbose:
         print(flops_analyzer.by_module())  # 打印每层 FLOPs
@@ -358,6 +373,21 @@ def compute_model_flops(
     total_training_flops = forward_flops_per_batch * (1 + backward_factor) * num_batches * epochs
 
     return total_training_flops
+
+# calculating parameters used in any model 
+def count_parameters(model):
+    total = 0
+    found_lora = False
+    # for _, module in model.named_modules():
+    #     if isinstance(module, LoRALayer):
+    #         found_lora = True
+    #         total += module.A.numel()
+    #         total += module.B.numel()
+    if found_lora:
+        return total
+    else:
+        total = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        return total
 
 def structured_prune_layer(model, layer_name='fc2', prune_ratio=0.5, criterion='l1'):
     """
@@ -487,9 +517,20 @@ def select_clients(client_loaders, use_all_clients=False, num_select=None,
                 local_model = apply_brute_pruning(local_model, layer_name='fc2')
 
             # 每轮都重新估计一次 FLOPs（避免模型变结构时不更新）
-            sample_flops = compute_model_flops(local_model, input_shape=(1, 1, 28, 28), prune = prune ,freeze = freeze)
+            sample_flops = compute_model_flops(
+                local_model,
+                input_shape=(1, 1, 28, 28),
+                prune=prune,
+                prune_ratio=prune_amount,
+                freeze=freeze,
+                freeze_layers=freeze_layers,
+                brute_prune=brute_prune
+            )
             n_samples = len(client_loader.dataset)
             total_flops += sample_flops * n_samples * epochs
+
+            # 计算Parameters
+            round_parameters = count_parameters(local_model)
 
             # 模型训练
             client_pre_models = copy.deepcopy(local_model)
@@ -508,7 +549,7 @@ def select_clients(client_loaders, use_all_clients=False, num_select=None,
 
         # 4. 选择 GRC 最高的前 num_select 个客户端
         selected_clients = [client_id for client_id, _ in client_grc_pairs[:num_select]]
-        return selected_clients, total_flops
+        return selected_clients, total_flops, round_parameters
 
     # 其余选择逻辑保持不变
 
@@ -967,6 +1008,7 @@ def run_experiment(rounds, client_loaders, test_loader, client_data_sizes,
     global_accuracies = []
     total_communication_counts = []
     total_tflops = 0
+    total_parameter = 0
     total_round_times = []
     total_times = []
 
@@ -991,7 +1033,7 @@ def run_experiment(rounds, client_loaders, test_loader, client_data_sizes,
 
         start_round_time = time.time()
 
-        selected_clients, round_flops = select_clients(
+        selected_clients, round_flops, round_parameters = select_clients(
             client_loaders, use_all_clients=False, num_select=2,
             select_by_loss=select_by_loss, global_model=global_model,grc=grc,
             prune=prune, prune_amount = prune_amount, freeze=freeze, freeze_layers=freeze_layers, brute_prune = brute_prune
@@ -1003,6 +1045,7 @@ def run_experiment(rounds, client_loaders, test_loader, client_data_sizes,
         total_round_times.append(round_time)
         update_communication_counts(communication_counts, selected_clients, "receive")
         total_tflops += round_flops / 1e12
+        total_parameter += round_parameters
 
         client_state_dicts = []
 
@@ -1069,7 +1112,7 @@ def run_experiment(rounds, client_loaders, test_loader, client_data_sizes,
             'GRC Weight - Loss', 'GRC Weight - Diff'])
         df.to_csv(csv_filename, index=False)
 
-    return global_accuracies, total_communication_counts ,total_tflops * rounds, total_round_times, total_times
+    return global_accuracies, total_communication_counts ,total_tflops * rounds, total_parameter , total_round_times, total_times
 
 def main4():
     torch.manual_seed(0)
@@ -1088,7 +1131,7 @@ def main4():
     test_loader = data.DataLoader(test_data, batch_size=32, shuffle=False)
 
     # 初始化全局模型
-    rounds = 100  # 联邦学习轮数
+    rounds = 500  # 联邦学习轮数
     use_all_clients = False  # 是否进行客户端选择
     num_selected_clients = 2  # 每轮选择客户端训练数量
     t_flops = 0
@@ -1110,22 +1153,22 @@ def main4():
     #                                                                                                             freeze=False, prune=True, prune_amount =0.6,
     #                                                                                                             select_by_loss=True, grc = False, label="Loss + Prune 0.6")
 
-    acc_grc, comm_grc, flops_grc, time_rounds_grc, time_grc = run_experiment(
+    acc_grc, comm_grc, flops_grc, parameters_grc ,time_rounds_grc, time_grc = run_experiment(
         rounds, client_loaders, test_loader, client_data_sizes,
         freeze=False, prune=False,select_by_loss=False, grc = True, label="GRA Only")
-    acc_grc_freeze_1, comm_grc_freeze_1, flops_grc_freeze_1, time_rounds_grc_freeze_1, time_grc_freeze_1 = run_experiment(
+    acc_grc_freeze_1, comm_grc_freeze_1, flops_grc_freeze_1, parameters_grc_freeze_1, time_rounds_grc_freeze_1, time_grc_freeze_1 = run_experiment(
         rounds, client_loaders, test_loader, client_data_sizes,
         freeze=True, prune=False,select_by_loss=False, grc = True, label="GRA + Freeze 1 Layer")
-    acc_grc_freeze_2, comm_grc_freeze_2, flops_grc_freeze_2, time_rounds_grc_freeze_2, time_grc_freeze_2 = run_experiment(
+    acc_grc_freeze_2, comm_grc_freeze_2, flops_grc_freeze_2, parameters_grc_freeze_2, time_rounds_grc_freeze_2, time_grc_freeze_2 = run_experiment(
         rounds, client_loaders, test_loader, client_data_sizes,
         freeze=True, freeze_layers = 2, prune=False,select_by_loss=False, grc = True, label="GRA + Freeze 2 Layers")
-    acc_grc_prune_30, comm_grc_prune_30, flops_grc_prune_30, time_rounds_grc_prune_30, time_grc_prune_30 = run_experiment(
+    acc_grc_prune_30, comm_grc_prune_30, flops_grc_prune_30, parameters_grc_prune_30, time_rounds_grc_prune_30, time_grc_prune_30 = run_experiment(
         rounds, client_loaders, test_loader, client_data_sizes,
         freeze=False, prune=True, prune_amount =0.3,select_by_loss=False, grc = True, label="GRA + Prune 0.3")
-    acc_grc_prune_60, comm_grc_prune_60, flops_grc_prune_60, time_rounds_grc_prune_60, time_grc_prune_60 = run_experiment(
+    acc_grc_prune_60, comm_grc_prune_60, flops_grc_prune_60, parameters_grc_prune_60, time_rounds_grc_prune_60, time_grc_prune_60 = run_experiment(
         rounds, client_loaders, test_loader, client_data_sizes,
         freeze=False, prune=True, prune_amount =0.6,select_by_loss=False, grc = True, label="GRA + Prune 0.6")
-    acc_grc_brute_prune, comm_grc_brute_prune, flops_grc_brute_prune, time_rounds_brute_prune, time_grc_brute_prune = run_experiment(
+    acc_grc_brute_prune, comm_grc_brute_prune, flops_grc_brute_prune, parameters_grc_brute_prune, time_rounds_brute_prune, time_grc_brute_prune = run_experiment(
         rounds, client_loaders, test_loader, client_data_sizes,
         freeze=False, prune=False, brute_prune = True ,select_by_loss=False, grc = True, label="GRA + Brute Prune")
 
@@ -1145,35 +1188,41 @@ def main4():
         "acc_grc_smooth": acc_grc_smooth,
         "comm_grc": comm_grc,
         "flops_grc": flops_grc,
+        "parameters_grc": parameters_grc,
         "time_rounds_grc": time_rounds_grc,
         "time_grc": time_grc,
         "acc_grc_freeze_1": acc_grc_freeze_1,
         "acc_grc_freeze_1_smooth": acc_grc_freeze_1_smooth,
         "comm_grc_freeze_1": comm_grc_freeze_1,
         "flops_grc_freeze_1": flops_grc_freeze_1,
+        "parameters_grc_freeze_1": parameters_grc_freeze_1,
         "time_rounds_grc_freeze_1": time_rounds_grc_freeze_1,
         "time_grc_freeze_1": time_grc_freeze_1,
         "acc_grc_freeze_2": acc_grc_freeze_2,
         "acc_grc_freeze_2_smooth": acc_grc_freeze_2_smooth,
         "comm_grc_freeze_2": comm_grc_freeze_2,
         "flops_grc_freeze_2": flops_grc_freeze_2,
+        "parameters_grc_freeze_2": parameters_grc_freeze_2,
         "time_rounds_grc_freeze_2": time_rounds_grc_freeze_2,
         "time_grc_freeze_2": time_grc_freeze_2,
         "acc_grc_prune_30": acc_grc_prune_30,
         "acc_grc_prune_30_smooth": acc_grc_prune_30_smooth,
         "comm_grc_prune_30": comm_grc_prune_30,
         "flops_grc_prune_30": flops_grc_prune_30,
+        "parameters_grc_prune_30": parameters_grc_prune_30,
         "time_rounds_grc_prune_30": time_rounds_grc_prune_30,
         "time_grc_prune_30": time_grc_prune_30,
         "acc_grc_prune_60": acc_grc_prune_60,
         "acc_grc_prune_60_smooth": acc_grc_prune_60_smooth,
         "comm_grc_prune_60": comm_grc_prune_60,
         "flops_grc_prune_60": flops_grc_prune_60,
+        "parameters_grc_prune_60": parameters_grc_prune_60,
         "time_rounds_grc_prune_60": time_rounds_grc_prune_60,
         "time_grc_prune_60": time_grc_prune_60,
         "acc_grc_brute_prune": acc_grc_brute_prune,
         "comm_grc_brute_prune": comm_grc_brute_prune,
         "flops_grc_brute_prune": flops_grc_brute_prune,
+        "parameters_grc_brute_prune": parameters_grc_brute_prune,
         "time_rounds_brute_prune": time_rounds_brute_prune,
         "time_grc_brute_prune": time_grc_brute_prune,
     }
@@ -1222,7 +1271,7 @@ def main4():
         "GRA + Freeze 2 Layers",
         "GRA + Prune 30%",
         "GRA + Prune 60%",
-        "Gra + Brute Prune",
+        "GRA + Brute Prune",
     ]
 
     flops_values_grc = [
@@ -1232,6 +1281,15 @@ def main4():
         flops_grc_prune_30,
         flops_grc_prune_60,
         flops_grc_brute_prune,
+    ]
+
+    parameter_value_grc = [
+        parameters_grc,
+        parameters_grc_freeze_1,
+        parameters_grc_freeze_2,
+        parameters_grc_prune_30,
+        parameters_grc_prune_60,
+        parameters_grc_brute_prune,
     ]
 
     time_values_rounds_grc = [
@@ -1252,15 +1310,15 @@ def main4():
         time_grc_brute_prune[-1],
     ]
 
-    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
-    bar_colors = ['skyblue', 'lightgreen','orange']
-    metrics = ['FLOPs (TFLOPs)', 'Rounds Time (s)', 'Total Time (s)']
-    titles = ['FLOPs Comparison', 'Rounds Time Comparison','Total Time Comparison']
+    fig, axes = plt.subplots(2, 2, figsize=(14, 12))
+    bar_colors = ['skyblue', 'lightgreen','orange', 'salmon']
+    metrics = ['FLOPs (TFLOPs)', 'Rounds Time (s)', 'Total Time (s)', 'Total Parameter (s)']
+    titles = ['FLOPs Comparison', 'Rounds Time Comparison','Total Time Comparison','Total Parameters Comparison']
 
     # # Loss-based
     # loss_values = [flops_values, model_size_values, inference_time_values]
     # GRC-based
-    grc_values = [flops_values_grc,time_values_rounds_grc ,time_values_grc]
+    grc_values = [flops_values_grc,time_values_rounds_grc ,time_values_grc, [p / 1e3 for p in parameter_value_grc]]
 
     # 绘制 Loss-based (上排)
     # for i in range(3):
@@ -1274,20 +1332,23 @@ def main4():
     #     axes[0, i].grid(axis='y', linestyle='--', alpha=0.7)
 
     # 绘制 GRC-based (下排)
-    for i in range(3):
-        bars = axes[i].bar(labels_grc, grc_values[i], color=bar_colors[i])
+    for i in range(4):
+        row = i // 2
+        col = i % 2
+        ax = axes[row][col]
+        bars = ax.bar(labels_grc, grc_values[i], color=bar_colors[i % len(bar_colors)])
         for bar in bars:
             height = bar.get_height()
-            axes[i].text(bar.get_x() + bar.get_width()/2.0, height, f"{height:.4f}", ha='center', va='bottom')
-        axes[i].set_title(titles[i] + " (GRA-based)")
-        axes[i].set_ylabel(metrics[i])
-        axes[i].tick_params(axis='x', rotation=20)
-        axes[i].grid(axis='y', linestyle='--', alpha=0.7)
+            ax.text(bar.get_x() + bar.get_width()/2.0, height, f"{height:.2f}", ha='center', va='bottom')
+        ax.set_title(titles[i] + " (GRA-based)")
+        ax.set_ylabel(metrics[i])
+        ax.tick_params(axis='x', rotation=20)
+        ax.grid(axis='y', linestyle='--', alpha=0.7)
 
     plt.tight_layout()
     plt.show()
 
-    fig, axes = plt.subplots(4, 2, figsize=(12, 16))
+    fig, axes = plt.subplots(4, 2, figsize=(12, 20))
 
     # ① Loss-based Accuracy Over Rounds
     # axes[0, 0].plot(acc_loss, label="Loss Only", marker='o')
@@ -1421,12 +1482,15 @@ def main4():
     time_total_3, acc_3 = prepend_zero(time_grc_freeze_2, acc_grc_freeze_2_smooth)
     time_total_4, acc_4 = prepend_zero(time_grc_prune_30, acc_grc_prune_30_smooth)
     time_total_5, acc_5 = prepend_zero(time_grc_prune_60, acc_grc_prune_60_smooth)
+    time_total_6, acc_6 = prepend_zero(time_grc_brute_prune, acc_grc_brute_prune_smooth)
 
     time_round_1, _ = prepend_zero(time_rounds_grc, acc_grc_smooth)
     time_round_2, _ = prepend_zero(time_rounds_grc_freeze_1, acc_grc_freeze_1_smooth)
     time_round_3, _ = prepend_zero(time_rounds_grc_freeze_2, acc_grc_freeze_2_smooth)
     time_round_4, _ = prepend_zero(time_rounds_grc_prune_30, acc_grc_prune_30_smooth)
     time_round_5, _ = prepend_zero(time_rounds_grc_prune_60, acc_grc_prune_60_smooth)
+    time_round_6, _ = prepend_zero(time_rounds_brute_prune, acc_grc_brute_prune_smooth)
+
 
     fig, axes = plt.subplots(1, 2, figsize=(14, 6))
 
@@ -1436,7 +1500,8 @@ def main4():
         'Freeze 1': 'tab:orange',
         'Freeze 2': 'tab:green',
         'Prune 30': 'tab:red',
-        'Prune 60': 'tab:purple'
+        'Prune 60': 'tab:purple',
+        'Brute Prune': 'tab: yellow'
     }
 
     # 左图：Total Training Time
@@ -1489,12 +1554,13 @@ def main4():
 
 
 def run_experiment_time(total_times, client_loaders, test_loader, client_data_sizes,
-                   freeze=False, freeze_layers = 1, prune=False, prune_amount = 0.3,
+                   freeze=False, freeze_layers = 1, prune=False, prune_amount = 0.3, brute_prune = False,
                    select_by_loss = False, grc = False, label="",):
     global_model = MLPModel()
     global_accuracies = []
     total_communication_counts = []
     total_tflops = 0
+    total_parameter = 0
     used_times = []
     time_count = 0
     rounds = 0
@@ -1520,14 +1586,15 @@ def run_experiment_time(total_times, client_loaders, test_loader, client_data_si
         print(f"\n🔁 [{label}] Round {rounds + 1}")
 
 
-        selected_clients, round_flops = select_clients(
+        selected_clients, round_flops, round_parameter = select_clients(
             client_loaders, use_all_clients=False, num_select=2,
             select_by_loss=select_by_loss, global_model=global_model,grc=grc,
-            prune=prune, prune_amount = prune_amount, freeze=freeze, freeze_layers=freeze_layers
+            prune=prune, prune_amount = prune_amount, freeze=freeze, freeze_layers=freeze_layers, brute_prune = brute_prune
         )
         print(f"Selected Clients: {selected_clients}")
         update_communication_counts(communication_counts, selected_clients, "receive")
         total_tflops += round_flops / 1e12
+        total_parameter += round_parameter
 
         client_state_dicts = []
 
@@ -1598,7 +1665,7 @@ def run_experiment_time(total_times, client_loaders, test_loader, client_data_si
             'GRC Weight - Loss', 'GRC Weight - Diff'])
         df.to_csv(csv_filename, index=False)
 
-    return global_accuracies, total_communication_counts ,total_tflops * rounds, rounds, used_times
+    return global_accuracies, total_communication_counts ,total_tflops * rounds, total_parameter, rounds, used_times
 
 def main5():
     torch.manual_seed(0)
@@ -1617,26 +1684,29 @@ def main5():
     test_loader = data.DataLoader(test_data, batch_size=32, shuffle=False)
 
     # 初始化全局模型
-    total_times = 1800  # 联邦学习轮数
+    total_times = 3000  # 训练时间
     use_all_clients = False  # 是否进行客户端选择
     num_selected_clients = 2  # 每轮选择客户端训练数量
     t_flops = 0
 
-    acc_grc, comm_grc, flops_grc, rounds_grc, time_grc = run_experiment_time(
+    acc_grc, comm_grc, flops_grc, parameters_grc, rounds_grc, time_grc = run_experiment_time(
         total_times, client_loaders, test_loader, client_data_sizes,
         freeze=False, prune=False,select_by_loss=False, grc = True, label="GRA Only")
-    acc_grc_freeze_1, comm_grc_freeze_1, flops_grc_freeze_1,rounds_grc_freeze_1, time_grc_freeze_1 = run_experiment_time(
+    acc_grc_freeze_1, comm_grc_freeze_1, flops_grc_freeze_1, parameters_grc_freeze_1, rounds_grc_freeze_1, time_grc_freeze_1 = run_experiment_time(
         total_times, client_loaders, test_loader, client_data_sizes,
         freeze=True, prune=False,select_by_loss=False, grc = True, label="GRA + Freeze 1 Layer")
-    acc_grc_freeze_2, comm_grc_freeze_2, flops_grc_freeze_2, rounds_grc_freeze_2, time_grc_freeze_2= run_experiment_time(
+    acc_grc_freeze_2, comm_grc_freeze_2, flops_grc_freeze_2, parameters_grc_freeze_2, rounds_grc_freeze_2, time_grc_freeze_2= run_experiment_time(
         total_times, client_loaders, test_loader, client_data_sizes,
         freeze=True, freeze_layers = 2, prune=False,select_by_loss=False, grc = True, label="GRA + Freeze 2 Layers")
-    acc_grc_prune_30, comm_grc_prune_30, flops_grc_prune_30, rounds_grc_prune_30, time_grc_prune_30 = run_experiment_time(
+    acc_grc_prune_30, comm_grc_prune_30, flops_grc_prune_30, parameters_grc_prune_30, rounds_grc_prune_30, time_grc_prune_30 = run_experiment_time(
         total_times, client_loaders, test_loader, client_data_sizes,
         freeze=False, prune=True, prune_amount =0.3,select_by_loss=False, grc = True, label="GRA + Prune 0.3")
-    acc_grc_prune_60, comm_grc_prune_60, flops_grc_prune_60,rounds_grc_prune_60, time_grc_prune_60 = run_experiment_time(
+    acc_grc_prune_60, comm_grc_prune_60, flops_grc_prune_60, parameters_grc_prune_60, rounds_grc_prune_60, time_grc_prune_60 = run_experiment_time(
         total_times, client_loaders, test_loader, client_data_sizes,
         freeze=False, prune=True, prune_amount =0.6,select_by_loss=False, grc = True, label="GRA + Prune 0.6")
+    acc_grc_brute_prune, comm_grc_brute_prune, flops_grc_brute_prune, parameters_grc_brute_prune, rounds_grc_brute_prune, time_grc_brute_prune = run_experiment_time(
+        total_times, client_loaders, test_loader, client_data_sizes,
+        freeze=False, prune=False, brute_prune=True, select_by_loss=False, grc=True, label="GRA + Brute Prune")
 
     # ① 准备 rolling average
     acc_grc_smooth = pd.Series(acc_grc).rolling(window=10, min_periods=1).mean()
@@ -1644,6 +1714,7 @@ def main5():
     acc_grc_freeze_2_smooth = pd.Series(acc_grc_freeze_2).rolling(window=10, min_periods=1).mean()
     acc_grc_prune_30_smooth = pd.Series(acc_grc_prune_30).rolling(window=10, min_periods=1).mean()
     acc_grc_prune_60_smooth = pd.Series(acc_grc_prune_60).rolling(window=10, min_periods=1).mean()
+    acc_grc_brute_prune_smooth = pd.Series(acc_grc_brute_prune).rolling(window=10, min_periods=1).mean(),
 
     save_dir = "federated_results_time"
     os.makedirs(save_dir, exist_ok=True)
@@ -1679,6 +1750,18 @@ def main5():
         "flops_grc_prune_60": flops_grc_prune_60,
         "rounds_grc_prune_60": rounds_grc_prune_60,
         "time_grc_prune_60": time_grc_prune_60,
+        "acc_grc_brute_prune": acc_grc_brute_prune,
+        "acc_grc_brute_prune_smooth": acc_grc_brute_prune_smooth,
+        "comm_grc_brute_prune": comm_grc_brute_prune,
+        "flops_grc_brute_prune": flops_grc_brute_prune,
+        "parameters_grc_brute_prune": parameters_grc_brute_prune,
+        "rounds_grc_brute_prune": rounds_grc_brute_prune,
+        "time_grc_brute_prune": time_grc_brute_prune,
+        "parameters_grc": parameters_grc,
+        "parameters_grc_freeze_1": parameters_grc_freeze_1,
+        "parameters_grc_freeze_2": parameters_grc_freeze_2,
+        "parameters_grc_prune_30": parameters_grc_prune_30,
+        "parameters_grc_prune_60": parameters_grc_prune_60,
     }
 
 
@@ -1692,6 +1775,7 @@ def main5():
         "GRA + Freeze 2 Layers",
         "GRA + Prune 30%",
         "GRA + Prune 60%",
+        "GRA + Brute Prune",
     ]
 
     flops_values_grc = [
@@ -1700,6 +1784,16 @@ def main5():
         flops_grc_freeze_2,
         flops_grc_prune_30,
         flops_grc_prune_60,
+        flops_grc_brute_prune,
+    ]
+
+    parameter_value_grc = [
+        parameters_grc,
+        parameters_grc_freeze_1,
+        parameters_grc_freeze_2,
+        parameters_grc_prune_30,
+        parameters_grc_prune_60,
+        parameters_grc_brute_prune,
     ]
 
     round_counts_grc = [
@@ -1708,21 +1802,20 @@ def main5():
         rounds_grc_freeze_2,
         rounds_grc_prune_30,
         rounds_grc_prune_60,
+        rounds_grc_brute_prune
     ]
 
-    fig, axes = plt.subplots(1, 2, figsize=(12, 6))
-    bar_colors = ['skyblue', 'lightgreen','orange']
-    metrics = ['FLOPs (TFLOPs)', 'Round']
-    titles = ['FLOPs Comparison', 'Rounds Comparison']
-    # GRC-based
-    grc_values = [flops_values_grc,round_counts_grc]
+    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+    bar_colors = ['skyblue', 'lightgreen', 'orange']
+    metrics = ['FLOPs (TFLOPs)', 'Rounds', 'Params (K)']
+    titles = ['FLOPs Comparison', 'Rounds Comparison', 'Parameters Comparison']
+    grc_values = [flops_values_grc, round_counts_grc, [p / 1e3 for p in parameter_value_grc]]  # 转为 K 个参数
 
-    # 绘制 GRC-based (下排)
-    for i in range(2):
-        bars = axes[i].bar(labels_grc, grc_values[i], color=bar_colors[i])
+    for i in range(3):
+        bars = axes[i].bar(labels_grc, grc_values[i], color=bar_colors[i % len(bar_colors)])
         for bar in bars:
             height = bar.get_height()
-            axes[i].text(bar.get_x() + bar.get_width()/2.0, height, f"{height:.4f}", ha='center', va='bottom')
+            axes[i].text(bar.get_x() + bar.get_width()/2.0, height, f"{height:.2f}", ha='center', va='bottom')
         axes[i].set_title(titles[i] + " (GRA-based)")
         axes[i].set_ylabel(metrics[i])
         axes[i].tick_params(axis='x', rotation=20)
@@ -1814,6 +1907,7 @@ def main5():
     time_total_3, acc_3 = prepend_zero(time_grc_freeze_2, acc_grc_freeze_2_smooth)
     time_total_4, acc_4 = prepend_zero(time_grc_prune_30, acc_grc_prune_30_smooth)
     time_total_5, acc_5 = prepend_zero(time_grc_prune_60, acc_grc_prune_60_smooth)
+    time_total_6, acc_6 = prepend_zero(time_grc_brute_prune, pd.Series(acc_grc_brute_prune).rolling(window=10, min_periods=1).mean())
 
     # time_round_1, _ = prepend_zero(time_rounds_grc, acc_grc_smooth)
     # time_round_2, _ = prepend_zero(time_rounds_grc_freeze_1, acc_grc_freeze_1_smooth)
@@ -1847,6 +1941,9 @@ def main5():
 
     axes.plot(time_total_5, acc_5, marker='v', label='GRA + Prune 60%', color=colors['Prune 60'])
     axes.fill_between(time_total_5, acc_5, alpha=0.2, color=colors['Prune 60'])
+
+    axes.plot(time_total_6, acc_6, marker='*', label='GRA + Brute Prune', color='olive')
+    axes.fill_between(time_total_6, acc_6, alpha=0.2, color='olive')
 
     axes.set_title("Accuracy vs Total Training Time")
     axes.set_xlabel("Cumulative Total Time (s)")
