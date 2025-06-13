@@ -12,93 +12,134 @@ import csv
 import pandas as pd
 from datetime import datetime
 import time
-from copy import deepcopy
+from fvcore.nn import FlopCountAnalysis # library for calculating flops
 
 
-# 定义 MLP 模型
+# Define MLP Model
 class MLPModel(nn.Module):
     def __init__(self):
         super(MLPModel, self).__init__()
-        self.fc1 = nn.Linear(28 * 28, 200)  # 第一层，输入维度 784 -> 200
-        self.fc2 = nn.Linear(200, 200)  # 第二层，200 -> 200
-        self.fc3 = nn.Linear(200, 10)  # 输出层，200 -> 10
+        self.fc1 = nn.Linear(28 * 28, 200)  # first layer 784 -> 200
+        self.fc2 = nn.Linear(200, 200)  # second layer，200 -> 200
+        self.fc3 = nn.Linear(200, 10)  # output layer，200 -> 10
         self.relu = nn.ReLU()
 
     def forward(self, x):
-        x = x.view(x.size(0), -1)  # 展平输入 (batch_size, 1, 28, 28) -> (batch_size, 784)
+        x = x.view(x.size(0), -1)  # flaten inputs (batch_size, 1, 28, 28) -> (batch_size, 784)
         x = self.relu(self.fc1(x))
         x = self.relu(self.fc2(x))
-        x = self.fc3(x)  # 直接输出，不使用 Softmax（因为 PyTorch 的 CrossEntropyLoss 里已经包含了）
+        x = self.fc3(x) 
         return x
 
 
+# SVD cache class
+class SVDCache:
+    def __init__(self):
+        self.cache = {}  # format: {layer_name: (U_r, S_r, V_r)}
+
+    def get_svd(self, layer_name, linear_layer, rank):
+        """Obtain the SVD result. If it exists in the cache, return it directly; otherwise, calculate and cache it"""
+        if layer_name in self.cache:
+            return self.cache[layer_name]
+
+        # compute SVD
+        W = linear_layer.weight.data.float()
+        U, S, V = torch.svd(W)
+
+        U_r = U[:, :rank]  # [in_features, rank]
+        S_r = torch.diag(S[:rank])  # [rank, rank]
+        V_r = V.T[:rank, :]  # [rank, out_features]
+
+        # Cache results 
+        self.cache[layer_name] = (U_r, S_r, V_r)
+        return U_r, S_r, V_r
+
+
 class LoRALayer(nn.Module):
-    def __init__(self, A=None, B=None, alpha=None, rank=None, bias=None):
-        super().__init__()
+    def __init__(self, in_features, out_features, rank=4, alpha=1, use_svd=False, base_linear=None, svd_cache=None,
+                 layer_name=None, r_in = 4):
+        super(LoRALayer, self).__init__()
         self.rank = rank
         self.alpha = alpha
         self.scaling = alpha / rank
-        self.A = nn.Parameter(A.clone())
-        self.B = nn.Parameter(B.clone())
-        # self.relu = nn.ReLU()
-        # if bias is not None:
-        #     self.bias = nn.Parameter(bias.clone())  
-        # else:
-        #     self.bias = None
+        self.use_svd = use_svd
+        self.relu = nn.ReLU()
+        self.r_in = r_in
+
+        self.base_bias = None
+        if base_linear is not None and base_linear.bias is not None:
+            self.base_bias = base_linear.bias.detach().clone()
+
+        if self.use_svd and base_linear is not None and svd_cache is not None:
+            U_r, S_r, V_r = svd_cache.get_svd(layer_name, base_linear, rank)
+
+            # sqrt_S = torch.sqrt(S_r)  # [rank, rank] 对角矩阵
+            # A = U_r @ sqrt_S  # [out_features, rank]
+            # B = sqrt_S @ V_r  # [rank, in_features]
+
+            A_outer = U_r.clone()  # [in_features, r_out]
+            B_outer = V_r.clone()  # [r_out, out_features]
+
+            S_diag = torch.sqrt(S_r)  # [r_out, r_out]
+
+            # Step 5: initializing inner LoRA
+            if rank % r_in == 0:
+                step_size = rank // r_in
+                A_inner = S_diag[:, ::step_size][:, :r_in]  # [r_out, r_in]
+                B_inner = S_diag[::step_size, :][:r_in, :]  # [r_in, r_out]
+            else:
+                A_inner = S_diag[:, :r_in]  # [r_out, r_in]
+                B_inner = S_diag[:r_in, :]  # [r_in, r_out]
+
+            self.A_inner = nn.Parameter(A_inner.contiguous())
+            self.B_inner = nn.Parameter(B_inner.contiguous())
+            self.A_outer = nn.Parameter(A_outer.contiguous(), requires_grad=False)
+            self.B_outer = nn.Parameter(B_outer.contiguous(), requires_grad=False)
+
+        else:
+            self.A = nn.Parameter(torch.zeros(in_features, rank))
+            self.B = nn.Parameter(torch.zeros(rank, out_features))
+            nn.init.normal_(self.A, mean=0.0, std=0.02)
+            nn.init.zeros_(self.B)
 
     def forward(self, x):
-        # out = x @ (self.A @ self.B) * self.scaling
-        # if self.bias is not None:
-        #     out = out + self.bias
-        # return out
-        return x @ (self.A @ self.B) * self.scaling # [in, rank] @ [rank, out]
+        AB = self.A_outer @ self.A_inner @ self.B_inner @ self.B_outer
+        output =AB @ x.T
+        if self.base_bias is not None:
+            output += self.base_bias.unsqueeze(1)
+        return output.T
 
 
-
-# 定义带 LoRA 的 MLP 模型
+# define LoRA based MLP Model
 class LoRAMLPModel(nn.Module):
-    def __init__(self, base_model, rank=70, alpha=1, lora_AB_dict=None):
+    def __init__(self, base_model, rank=4, alpha=1, use_svd=True, svd_cache=None,r_in = 4):
         super(LoRAMLPModel, self).__init__()
         self.base_model = base_model
-        
+
         for param in base_model.parameters():
             param.requires_grad = False
-        
-        A1, B1 = lora_AB_dict['fc1']
-        A2, B2 = lora_AB_dict['fc2']
-        A3, B3 = lora_AB_dict['fc3']
 
-        self.lora_fc1 = LoRALayer(A1, B1, alpha=alpha, rank=rank)
-        self.lora_fc2 = LoRALayer(A2, B2, alpha=alpha, rank=rank)
-        self.lora_fc3 = LoRALayer(A3, B3, alpha=alpha, rank=rank)
-
-        # bias_1 = base_model.fc1.bias.data.clone()
-        # bias_2 = base_model.fc2.bias.data.clone()
-        # bias_3 = base_model.fc3.bias.data.clone()
-
-        # self.lora_fc1 = LoRALayer(A1, B1, alpha=alpha, rank=rank, bias=bias_1)
-        # self.lora_fc2 = LoRALayer(A2, B2, alpha=alpha, rank=rank, bias=bias_2)
-        # self.lora_fc3 = LoRALayer(A3, B3, alpha=alpha, rank=rank, bias=bias_3)
-        # self.fc3_2 = nn.Linear(200, 10)
-
+        # Utilise SVD cache
+        self.lora_fc1 = LoRALayer(28 * 28, 200, rank=rank, alpha=alpha, use_svd=use_svd,
+                                  base_linear=base_model.fc1, svd_cache=svd_cache, layer_name='fc1',r_in = r_in)
+        self.lora_fc2 = LoRALayer(200, 200, rank=rank, alpha=alpha, use_svd=use_svd,
+                                  base_linear=base_model.fc2, svd_cache=svd_cache, layer_name='fc2',r_in = r_in)
+        # self.lora_fc3 = LoRALayer(28 * 28, 10, rank=rank, alpha=alpha, use_svd=use_svd,
+        #                           base_linear=base_model.fc3, svd_cache=svd_cache, layer_name='fc3',r_in = r_in)
+        self.fc3_2 = nn.Linear(200, 10)
 
     def forward(self, x):
-        x = x.view(x.size(0), -1)  # 展平输入
+        x = x.view(x.size(0), -1)  # Flatten input
 
-        # 前向传播结合基础模型和 LoRA 部分
-        fc1_out = self.base_model.relu(self.base_model.fc1(x) + self.lora_fc1(x))
-        fc2_out = self.base_model.relu(self.base_model.fc2(fc1_out) + self.lora_fc2(fc1_out))
-        out = self.base_model.fc3(fc2_out) + self.lora_fc3(fc2_out)
-
-        # # 前向传播结合基础模型和 LoRA 部分
-        # fc1_out = self.lora_fc1.relu(self.lora_fc1(x))
-        # fc2_out = self.lora_fc2.relu(self.lora_fc2(fc1_out))
-        # out = self.fc3_2(fc2_out)
+        # Forward propagation combines the basic model and the LoRA part
+        fc1_out = self.lora_fc1.relu(self.lora_fc1(x))
+        fc2_out = self.lora_fc2.relu(self.lora_fc2(fc1_out))
+        out = self.fc3_2(fc2_out)
 
         return out
 
 
-# 加载 MNIST 数据集
+# loading MNIST data
 def load_mnist_data(data_path="./data"):
     transform = transforms.Compose([transforms.ToTensor(), transforms.Normalize((0.1307,), (0.3081,))])
 
@@ -114,7 +155,7 @@ def load_mnist_data(data_path="./data"):
     return train_data, test_data
 
 
-# 显示数据集示例图片
+# Display sample images of the dataset
 def visualize_mnist_samples(dataset, num_samples=10):
     fig, axes = plt.subplots(1, num_samples, figsize=(num_samples * 1.2, 1.5))
     for i in range(num_samples):
@@ -128,48 +169,48 @@ def visualize_mnist_samples(dataset, num_samples=10):
 def split_data_by_label(dataset, num_clients=10):
     client_data_sizes = {
         0: {0: 600},
-        1: {1: 700},
-        2: {2: 500},
+        1: {1: 600},
+        2: {2: 600},
         3: {3: 600},
         4: {4: 600},
-        5: {5: 500},
-        6: {6: 100},
-        7: {7: 100},
-        8: {8: 100},
-        9: {9: 100}
+        5: {5: 600},
+        6: {6: 600},
+        7: {7: 600},
+        8: {8: 600},
+        9: {9: 600}
     }
 
-    # 统计每个类别的数据索引
-    label_to_indices = {i: [] for i in range(10)}  # 记录每个类别的索引
+    # Count the data index of each category
+    label_to_indices = {i: [] for i in range(10)}  # Record the index of each category
     for idx, (_, label) in enumerate(dataset):
         label_to_indices[label].append(idx)
 
-    # 初始化客户端数据存储
+    # Initialize the client data store 
     client_data_subsets = {}
-    client_actual_sizes = {i: {label: 0 for label in range(10)} for i in range(num_clients)}  # 记录实际分配的数据量
+    client_actual_sizes = {i: {label: 0 for label in range(10)} for i in range(num_clients)}  # Record the actual amount of data allocated
 
-    # 遍历每个客户端，为其分配指定类别的数据
+    # Traverse each client and assign data of the specified category to it
     for client_id, label_info in client_data_sizes.items():
-        selected_indices = []  # 临时存储该客户端所有选中的索引
+        selected_indices = []  # Temporarily store all the selected indexes of this client
         for label, size in label_info.items():
-            # 确保不超出类别数据集实际大小
+            # Make sure not to exceed the actual size of the category dataset
             available_size = len(label_to_indices[label])
             sample_size = min(available_size, size)
 
             if sample_size < size:
                 print(f"⚠️ 警告：类别 {label} 的数据不足，客户端 {client_id} 只能获取 {sample_size} 条样本（需求 {size} 条）")
 
-            # 从该类别中随机抽取样本
+            # Randomly draw samples from this category
             sampled_indices = random.sample(label_to_indices[label], sample_size)
             selected_indices.extend(sampled_indices)
 
-            # 记录实际分配的数据量
+            # Record the actual amount of data allocated
             client_actual_sizes[client_id][label] = sample_size
 
-        # 创建 PyTorch Subset
+        # Create PyTorch Subset
         client_data_subsets[client_id] = torch.utils.data.Subset(dataset, selected_indices)
 
-    # 打印每个客户端的实际分配数据量
+    # Print the actual amount of allocated data for each client
     print("\n📊 每个客户端实际数据分布:")
     for client_id, label_sizes in client_actual_sizes.items():
         print(f"客户端 {client_id}: {label_sizes}")
@@ -177,7 +218,7 @@ def split_data_by_label(dataset, num_clients=10):
     return client_data_subsets, client_actual_sizes
 
 
-# 本地训练函数 (用于正常的联邦训练，训练所有参数)
+# Local training function (for normal federated training, training all parameters)
 def local_train(model, train_loader, epochs=5, lr=0.01):
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.SGD(model.parameters(), lr=lr)
@@ -192,13 +233,11 @@ def local_train(model, train_loader, epochs=5, lr=0.01):
     return model.state_dict()
 
 
-# LoRA训练函数 (只训练LoRA参数，用于客户端选择阶段)
-def local_train_lora(base_model, train_loader, epochs=2, lr=0.01, rank=4, alpha=1, lora_AB_dict=None):
-    # 创建LoRA模型
-    lora_model = LoRAMLPModel(base_model, rank=rank, alpha=alpha,lora_AB_dict=deepcopy(lora_AB_dict))
+# LoRA training function (Only training LoRA parameters, used in the client selection stage)
+def local_train_lora(base_model, train_loader, epochs=2, lr=0.01, rank=4, alpha=1, svd_cache=None,r_in = 4):
+    lora_model = LoRAMLPModel(base_model, rank=rank, alpha=alpha, svd_cache=svd_cache,r_in = r_in)
 
     criterion = nn.CrossEntropyLoss()
-    # 只优化LoRA参数
     optimizer = optim.SGD([p for n, p in lora_model.named_parameters() if p.requires_grad], lr=lr)
 
     lora_model.train()
@@ -213,18 +252,18 @@ def local_train_lora(base_model, train_loader, epochs=2, lr=0.01, rank=4, alpha=
             optimizer.step()
             loss_sq_sum += loss.item() ** 2
 
-    h_i = loss_sq_sum  # 累积loss平方和
+    h_i = loss_sq_sum  # accumulate loss square sum 
     return lora_model, h_i
 
 
-# 实时记录训练过程中的loss用做FedGRA (使用LoRA)
-def local_train_fedgra_loss_lora(model, train_loader, epochs=2, lr=0.01, rank=4, alpha=1, lora_AB_dict=None):
-    # 使用LoRA模型进行轻量级训练
-    lora_model, h_i = local_train_lora(model, train_loader, epochs=epochs, lr=lr, rank=rank, alpha=alpha, lora_AB_dict=lora_AB_dict)
+# Real-time recording of the loss during the training process for use as FedGRA (using LoRA)
+def local_train_fedgra_loss_lora(model, train_loader, epochs=2, lr=0.01, rank=4, alpha=1, svd_cache=None,r_in = 4):
+    lora_model, h_i = local_train_lora(model, train_loader, epochs=epochs, lr=lr, rank=rank, alpha=alpha,
+                                       svd_cache=svd_cache,r_in = r_in)
     return lora_model, h_i
 
 
-#  联邦平均聚合函数
+#  Federal average aggregation function
 def fed_avg(global_model, client_state_dicts, client_sizes):
     global_dict = global_model.state_dict()
     subkey = [sublist[0] for sublist in client_state_dicts]
@@ -239,7 +278,7 @@ def fed_avg(global_model, client_state_dicts, client_sizes):
     return global_model
 
 
-# 评估模型
+# Evaluate Model 
 def evaluate(model, test_loader):
     model.eval()
     criterion = nn.CrossEntropyLoss()
@@ -256,69 +295,117 @@ def evaluate(model, test_loader):
     return total_loss / len(test_loader), accuracy
 
 
-# 熵权法实现
+# Implemented the entropy weight method
 def entropy_weight(l):
     l = np.array(l)
 
-    # Step 1: Min-Max 归一化（避免负值和爆炸）
+    # Step 1: Min-Max normalization (to avoid negative values and explosions)
     X_norm = (l - l.min(axis=1, keepdims=True)) / (l.max(axis=1, keepdims=True) - l.min(axis=1, keepdims=True) + 1e-12)
 
-    # Step 2: 转为概率矩阵 P_ki
+    # Step 2: Convert to a probability matrix P_ki
     P = X_norm / (X_norm.sum(axis=1, keepdims=True) + 1e-12)
 
-    # Step 3: 计算熵
+    # Step 3: Calculate Entropy
     K = 1 / np.log(X_norm.shape[1])
     E = -K * np.sum(P * np.log(P + 1e-12), axis=1)  # shape: (2,)
 
-    # Step 4: 计算信息效用值 & 权重
+    # Step 4: Calculate the information utility value & weight
     d = 1 - E
     weights = d / np.sum(d)
     return weights.tolist()
 
 
-# 灰色关联度实现 (使用LoRA模型)
-def calculate_GRC(global_model, client_lora_models, client_losses):
+def calculate_GRC(global_model, client_lora_models, client_losses, initial_lora_params=None):
     """
-    计算 GRC 分数 + 熵权法权重
-    使用LoRA模型中的差异计算GRC
+    Compute GRC scores + entropy-based weights.
+    Use the difference between pre- and post-training LoRA parameters to compute GRC scores.
+    Modified to first compute the AB product, then calculate the difference.
+
+    Args:
+        global_model: The global model used for aggregation.
+        client_lora_models: List of LoRA models after client-side training.
+        client_losses: List of training losses for each client.
+        initial_lora_params: Dictionary of initial LoRA parameters before training {name: param_tensor}.
     """
-    # 计算参数差异（只考虑LoRA部分的参数）
+
     param_diffs = []
-    for lora_model in client_lora_models:
-        # 提取所有LoRA参数形成一个向量
-        lora_params = []
-        for name, param in lora_model.named_parameters():
-            if param.requires_grad:  # 只考虑LoRA部分参数
-                lora_params.append(param.detach().view(-1))
 
-        if lora_params:
-            lora_vec = torch.cat(lora_params)
-            # 用LoRA参数的L2范数作为差异度量
-            diff = torch.norm(lora_vec).item()
-            param_diffs.append(diff)
+    for trained_lora_model in client_lora_models:
+        if initial_lora_params is not None:
+            diff_vectors = []
+            
+            # Collect LoRA layers
+            lora_layers = {
+                'lora_fc1': trained_lora_model.lora_fc1,
+                'lora_fc2': trained_lora_model.lora_fc2,
+                # 'lora_fc3': trained_lora_model.lora_fc3
+            }
+
+            for layer_name, lora_layer in lora_layers.items():
+                current_AB = lora_layer.A @ lora_layer.B  # [in_features, out_features]
+                A_name = f"{layer_name}.A"
+                B_name = f"{layer_name}.B"
+
+                if A_name in initial_lora_params and B_name in initial_lora_params:
+                    initial_A = initial_lora_params[A_name]
+                    initial_B = initial_lora_params[B_name]
+                    initial_AB = initial_A @ initial_B
+
+                    # Compute difference between current and initial AB products
+                    diff = current_AB - initial_AB
+                    diff_vectors.append(diff.view(-1))
+
+            if diff_vectors:
+                # Concatenate all difference vectors and compute L2 norm
+                diff_vec = torch.cat(diff_vectors)
+                diff = torch.norm(diff_vec, 2).item()
+                param_diffs.append(diff)
+            else:
+                param_diffs.append(0.0)
         else:
-            param_diffs.append(0.0)
+            # If no initial parameters are provided, compute L2 norm of current AB products
+            diff_vectors = []
 
-    # 2. 映射原始指标到 [0, 1] 区间（为熵权法准备）
+            # Collect LoRA layers from the model
+            lora_layers = {
+                'lora_fc1': trained_lora_model.lora_fc1,
+                'lora_fc2': trained_lora_model.lora_fc2,
+                'lora_fc3': trained_lora_model.lora_fc3
+            }
+
+            for layer_name, lora_layer in lora_layers.items():
+                # Compute current AB product
+                current_AB = lora_layer.A @ lora_layer.B  # [in_features, out_features]
+                diff_vectors.append(current_AB.view(-1))
+
+            if diff_vectors:
+                # Concatenate all AB products and compute L2 norm
+                diff_vec = torch.cat(diff_vectors)
+                diff = torch.norm(diff_vec, 2).item()
+                param_diffs.append(diff)
+            else:
+                param_diffs.append(0.0)
+
+    # 2. Normalize original metrics to [0, 1] range (for entropy weight method)
     def map_sequence_loss(sequence):
         max_val, min_val = max(sequence), min(sequence)
         denom = max_val - min_val if abs(max_val - min_val) > 1e-8 else 1e-8
-        return [(max_val - x) / denom for x in sequence]  # 越小越好，负相关
+        return [(max_val - x) / denom for x in sequence]  # Lower is better → negative correlation
 
     def map_sequence_diff(sequence):
         max_val, min_val = max(sequence), min(sequence)
         denom = max_val - min_val if abs(max_val - min_val) > 1e-8 else 1e-8
-        return [(x - min_val) / denom for x in sequence]  # 越大越好，正相关
+        return [(x - min_val) / denom for x in sequence]  # Higher is better → positive correlation
 
-    # 用于 GRC 的映射
+    # Mapping for GRC
     mapped_losses = map_sequence_loss(client_losses)
     mapped_diffs = map_sequence_diff(param_diffs)
 
-    # 3. 熵权法计算权重（根据映射值，非 GRC）
+    # 3. Compute weights using Entropy Weight Method (based on mapped values)
     grc_metrics = np.vstack([mapped_losses, mapped_diffs])  # shape: (2, n_clients)
     weights = entropy_weight(grc_metrics)  # w_loss, w_diff
 
-    # 4. 计算 GRC 分数（ξki），参考值为 1
+    # 4. Compute GRC scores (ξki), reference value is 1
     ref_loss, ref_diff = 1.0, 1.0
     delta_losses = [abs(x - ref_loss) for x in mapped_losses]
     delta_diffs = [abs(x - ref_diff) for x in mapped_diffs]
@@ -327,19 +414,19 @@ def calculate_GRC(global_model, client_lora_models, client_losses):
 
     grc_losses = []
     grc_diffs = []
-    rho = 0.5  # 区分度因子
+    rho = 0.5  # Distinguishing coefficient
     for d_loss, d_diff in zip(delta_losses, delta_diffs):
         grc_loss = (min_delta + rho * max_delta) / (d_loss + rho * max_delta)
         grc_diff = (min_delta + rho * max_delta) / (d_diff + rho * max_delta)
         grc_losses.append(grc_loss)
         grc_diffs.append(grc_diff)
 
-    # 5. 加权求和得到最终 GRC 分数
+    # 5. Compute final GRC score via weighted sum
     grc_losses = np.array(grc_losses)
     grc_diffs = np.array(grc_diffs)
     weighted_score = grc_losses * weights[0] + grc_diffs * weights[1]
 
-    # 调试（每个客户端的 loss、diff、得分）
+    # Debug output for each client: loss, diff, GRC score
     print("\n GRC得分]")
     for i in range(len(client_lora_models)):
         print(f"Client {i} | loss: {client_losses[i]:.4f}, diff: {param_diffs[i]:.4f}, "
@@ -353,32 +440,64 @@ def calculate_GRC(global_model, client_lora_models, client_losses):
 # 客户端选择器 (使用LoRA)
 def select_clients(client_loaders, use_all_clients=False, num_select=None,
                    select_by_loss=False, global_model=None, grc=False,
-                   fairness_tracker=None, lora_rank=4, lora_alpha=1, lora_AB_dict=None):
-    if grc:  # 使用 GRC 选择客户端
+                   fairness_tracker=None, lora_rank=4, lora_alpha=1,r_in = 4):
+    if grc:  
         client_lora_models = []
-        # 1. 使用LoRA训练本地模型并计算损失 (轻量级训练)
+
+        # create SVD cache - only store once 
+        svd_cache = SVDCache()
+
+        # 1. Only create an initial LoRA model as the benchmark
+        initial_lora_model = LoRAMLPModel(global_model, rank=lora_rank, alpha=lora_alpha, svd_cache=svd_cache)
+
+        # Store the initial LoRA parameter status
+        initial_lora_params = {}
+        for name, param in initial_lora_model.named_parameters():
+            if param.requires_grad:  # Only save the parameters of the LoRA part
+                initial_lora_params[name] = param.clone().detach()
+
+        # 2. Train the local model with LoRA and calculate the loss (lightweight training) 
         client_losses = []
+        param_count_this_round = 0 # storing parameter sum in this round 
+        flops_this_round = 0 # storing FLOPs sum in this round 
         for client_id, client_loader in client_loaders.items():
-            # 使用LoRA训练 - 减少训练成本
+            # Train with LoRA - reduce training costs and pass SVD cache
             trained_lora_model, h_i = local_train_fedgra_loss_lora(
-                global_model, client_loader, epochs=5, lr=0.01, rank=lora_rank, alpha=lora_alpha, lora_AB_dict=lora_AB_dict
+                global_model, client_loader, epochs=5, lr=0.0005,
+                rank=lora_rank, alpha=lora_alpha, svd_cache=svd_cache,r_in = r_in
             )
             client_lora_models.append(trained_lora_model)
             client_losses.append(h_i)
 
-        # 2. 计算 GRC 分数
-        grc_scores, grc_weights = calculate_GRC(global_model, client_lora_models, client_losses)
-        select_clients.latest_weights = grc_weights  # 记录权重
+            # Calculating parameters used in Model
+            param_count_this_round += count_nora_parameters(trained_lora_model) # adding up calculated parameters
 
-        # 3. 按 GRC 分数排序（从高到低，GRC越高表示越好）
+            # Calculating forward FLOPs
+            batch_size = 1
+            dummy_input = torch.randn(batch_size, 1, 28, 28).to(next(trained_lora_model.parameters()).device)
+            flops = FlopCountAnalysis(trained_lora_model, (dummy_input,))
+            forward_flops = flops.total()
+
+            # Estimate total training FLOPs (forward + backward)
+            # Assumption: for each batch, forward + backward ≈ 3 × forward FLOPs; for each client: num_batches × num_epochs × 3 × forward FLOPs
+            # the number of batches = len(client_loader)
+            num_batches = len(client_loader)
+            flops_per_client = forward_flops * 3 * num_batches * 5 # 5 = number of epochs
+            flops_this_round += flops_per_client
+
+        # 3. Calculate the GRC score and now pass the initial LoRA parameter state
+        grc_scores, grc_weights = calculate_GRC(global_model, client_lora_models, client_losses, initial_lora_params)
+        select_clients.latest_weights = grc_weights  
+
+        # 4. Sort by GRC score (from high to low, the higher the GRC, the better)
         client_grc_pairs = list(zip(client_loaders.keys(), grc_scores))
-        client_grc_pairs.sort(key=lambda x: x[1], reverse=True)  # 降序排序
+        client_grc_pairs.sort(key=lambda x: x[1], reverse=True) 
 
-        # 4. 选择 GRC 最高的前 num_select 个客户端
+        # 5. Select the top num_select clients with the highest GRC
         selected_clients = [client_id for client_id, _ in client_grc_pairs[:num_select]]
-        return selected_clients
+        return selected_clients, param_count_this_round, flops_this_round
 
-    # 其余选择逻辑保持不变
+    # Others remain the same 
 
     if use_all_clients is True:
         print("Selecting all clients")
@@ -412,38 +531,18 @@ def update_communication_counts(communication_counts, selected_clients, event):
         if event == "send" and communication_counts[client_id]['receive'] > 0:
             communication_counts[client_id]['full_round'] += 1
 
+# calculating parameters used in any model 
+def count_nora_parameters(model):
+    total = 0
+    for name, module in model.named_modules():
+        if isinstance(module, LoRALayer):
+            if hasattr(module, "A_outer") and hasattr(module, "A_inner") and hasattr(module, "B_inner") and hasattr(module, "B_outer"):
+                total += module.A_outer.numel()
+                total += module.A_inner.numel()
+                total += module.B_inner.numel()
+                total += module.B_outer.numel()
+    return total
 
-def extract_lora_from_linear(base_linear: nn.Linear, rank=4, alpha=1.0):
-
-    W = base_linear.weight.data.float()  # [out_features, in_features]
-    V, S, U= torch.svd(W)  # V: [rank: 200, out:200], S: [rank: 200, rank: 200], U: [in: 784, rank: 200], W: [out: 200, in: 784]
-
-    # print("W shape:", W.shape)
-    # print("U shape:", U.shape)
-    # print("S shape:", S.shape)
-    # print("Vh shape:", V.shape)
-
-    # Truncate
-    U_r = U[:, :rank]              # [out_features, rank]
-    S_r = torch.diag(S[:rank])     # [rank, rank]
-    V_r = V[:, :rank].t()          # [rank, in_features]
-
-    # print("W shape:", W.shape)
-    # print("U_r shape:", U_r.shape)
-    # print("S_r shape:", S_r.shape)
-    # print("V_r shape:", V_r.shape)
-        
-    # Use SVD components to initialize A and B
-    A = U_r # [in_features, rank]
-    B = (S_r @ V_r)  # [rank, out_features]
-        
-    A_res = A.contiguous()* 0.1
-    B_res = B.contiguous()
-
-    # print("Acticate SVD !!!!!!!!!!!!!!!!!!!!!!!!!!!!")
-
-    return A_res, B_res
-    
 
 def main():
     torch.manual_seed(0)
@@ -465,17 +564,20 @@ def main():
     global_model = MLPModel()
     global_accuracies = []  # 记录每轮全局模型的测试集准确率
     total_communication_counts = []  # 记录每轮客户端通信次数
-    rounds = 300 # 联邦学习轮数
+    rounds = 500  # 联邦学习轮数
     use_all_clients = False  # 是否进行客户端选择
     num_selected_clients = 2  # 每轮选择客户端训练数量
     use_loss_based_selection = False  # 是否根据 loss 选择客户端
     grc = True
 
-    start_time = time.time() # Starting time 
-
     # LoRA超参数
     lora_rank = 8  # LoRA秩
-    lora_alpha = 16  # LoRA缩放因子
+    lora_alpha = 16
+    r_in = 4
+
+    start_time = time.time() # Starting time 
+    accumulated_params = 0
+    accumulated_flops = 0
 
     # 初始化通信计数器
     communication_counts = {}
@@ -492,28 +594,19 @@ def main():
     csv_data = []
 
     for r in range(rounds):
-        # One time SVD generation of AB from global model 
-        lora_AB_dict = {
-            'fc1': extract_lora_from_linear(global_model.fc1),
-            'fc2': extract_lora_from_linear(global_model.fc2),
-            'fc3': extract_lora_from_linear(global_model.fc3),
-        }
-
         print(f"\n🔄 第 {r + 1} 轮聚合")
         # 选择客户端 (使用LoRA减少计算成本)
-        selected_clients = select_clients(
+        selected_clients, param_count_this_round, flops_this_round = select_clients(
             client_loaders,
             use_all_clients=use_all_clients,
             num_select=num_selected_clients,
             select_by_loss=use_loss_based_selection,
             global_model=global_model,
-            grc=grc, 
+            grc=grc,
             lora_rank=lora_rank,
-            lora_alpha=lora_alpha, 
-            lora_AB_dict=lora_AB_dict
+            lora_alpha=lora_alpha,
+            r_in = r_in
         )
-
-        elapsed_time = time.time() - start_time
 
         # 记录客户端接收通信次数
         update_communication_counts(communication_counts, selected_clients, "receive")
@@ -524,7 +617,7 @@ def main():
             client_loader = client_loaders[client_id]
             local_model = MLPModel()
             local_model.load_state_dict(global_model.state_dict())  # 复制全局模型参数
-            local_state = local_train(local_model, client_loader, epochs=5, lr=0.01)  # 训练5轮
+            local_state = local_train(local_model, client_loader, epochs=2, lr=0.01)  # 训练5轮
             client_state_dicts.append((client_id, local_state))  # 存储 (客户端ID, 训练后的参数)
 
             update_communication_counts(communication_counts, [client_id], "send")  # 记录客户端上报通信次数
@@ -563,18 +656,25 @@ def main():
             w_loss = 'NA'
             w_diff = 'NA'
 
+        elapsed_time = time.time() - start_time
+        accumulated_params += param_count_this_round # adding up parameters
+        accumulated_flops += flops_this_round# adding up flops  
+
         csv_data.append([
             r + 1,
             accuracy,
             total_comm,
             ",".join(map(str, selected_clients)),
             w_loss,
-            w_diff, 
-            round(elapsed_time, 2) 
+            w_diff,
+            round(elapsed_time, 2), 
+            accumulated_params, 
+            accumulated_flops
         ])
+
         df = pd.DataFrame(csv_data, columns=[
             'Round', 'Accuracy', 'Total communication counts', 'Selected Clients',
-            'GRC Weight - Loss', 'GRC Weight - Diff', 'Elapsed Time (s)'])
+            'GRC Weight - Loss', 'GRC Weight - Diff', 'Elapsed Time (s)', 'Parameter Usage', 'FLOPs'])
         df.to_csv(csv_filename, index=False)
 
     # 输出最终模型的性能
@@ -604,7 +704,7 @@ def main():
     #          label="Test Accuracy vs. Communication")
     # plt.xlabel("Total Communication Count per Round")
     # plt.ylabel("Accuracy")
-    # plt.title("Test Accuracy vs. Total Communication")s
+    # plt.title("Test Accuracy vs. Total Communication")
     # plt.legend()
     # plt.grid(True)
     # plt.show()
@@ -615,4 +715,7 @@ if __name__ == "__main__":
     main()
     T2 = time.time()
     print('程序运行时间:%s秒' % ((T2 - T1)))
-    # 程序运行时间:328.0528028011322秒
+    # 1520.884345293045
+    # 100 453.0890119075775秒  程序运行时间:440.32077145576477秒
+
+
